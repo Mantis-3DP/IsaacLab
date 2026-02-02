@@ -6,14 +6,15 @@
 services:
   cloudxr-runtime:
     image: ${CLOUDXR_RUNTIME_BASE_IMAGE_ARG}:${CLOUDXR_RUNTIME_VERSION_ARG}
-    ports:
-      - "48010:48010/tcp" # signaling
-      - "47998:47998/udp" # media
-      - "47999:47999/udp" # media
-      - "48000:48000/udp" # media
-      - "48005:48005/udp" # media
-      - "48008:48008/udp" # media
-      - "48012:48012/udp" # media
+    network_mode: host
+    # ports commented out - using host network for WebRTC
+    # - "48010:48010/tcp" # signaling
+    # - "47998:47998/udp" # media
+    # - "47999:47999/udp" # media
+    # - "48000:48000/udp" # media
+    # - "48005:48005/udp" # media
+    # - "48008:48008/udp" # media
+    # - "48012:48012/udp" # media
     healthcheck:
       test: ["CMD", "test", "-S", "/openxr/run/ipc_cloudxr"]
       interval: 1s
@@ -36,8 +37,12 @@ services:
     environment:
       - XDG_RUNTIME_DIR=/openxr/run
       - XR_RUNTIME_JSON=/openxr/share/openxr/1/openxr_cloudxr.json
+      - LD_LIBRARY_PATH=/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/cmeel.prefix/lib:${LD_LIBRARY_PATH}
     volumes:
       - openxr-volume:/openxr:rw
+      - type: bind
+        source: ../datasets
+        target: ${DOCKER_ISAACLAB_PATH}/datasets
     depends_on:
         - cloudxr-runtime
     deploy:

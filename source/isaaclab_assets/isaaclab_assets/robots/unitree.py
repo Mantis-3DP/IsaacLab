@@ -406,12 +406,13 @@ G1_29DOF_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.75),
+        pos=(0.0, 0.0, 0.74),
         rot=(0.7071, 0, 0, 0.7071),
         joint_pos={
-            ".*_hip_pitch_joint": -0.10,
-            ".*_knee_joint": 0.30,
-            ".*_ankle_pitch_joint": -0.20,
+            # More bent stance for stability (matches G1_CFG)
+            ".*_hip_pitch_joint": -0.20,
+            ".*_knee_joint": 0.42,
+            ".*_ankle_pitch_joint": -0.23,
         },
         joint_vel={".*": 0.0},
     ),
@@ -443,9 +444,9 @@ G1_29DOF_CFG = ArticulationCfg(
                 ".*_knee_joint": 200.0,
             },
             damping={
-                ".*_hip_yaw_joint": 2.5,
-                ".*_hip_roll_joint": 2.5,
-                ".*_hip_pitch_joint": 2.5,
+                ".*_hip_yaw_joint": 5.0,   # Increased from 2.5 for stability
+                ".*_hip_roll_joint": 5.0,  # Increased from 2.5 for stability
+                ".*_hip_pitch_joint": 5.0, # Increased from 2.5 for stability
                 ".*_knee_joint": 5.0,
             },
             armature={
@@ -461,8 +462,8 @@ G1_29DOF_CFG = ArticulationCfg(
                 ".*_ankle_roll_joint": 20.0,
             },
             damping={
-                ".*_ankle_pitch_joint": 0.2,
-                ".*_ankle_roll_joint": 0.1,
+                ".*_ankle_pitch_joint": 2.0,  # Increased from 0.2 for stability
+                ".*_ankle_roll_joint": 2.0,   # Increased from 0.1 for stability
             },
             effort_limit={
                 ".*_ankle_pitch_joint": 50.0,

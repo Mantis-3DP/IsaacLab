@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import enum
 import os
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
-
 import torch
+from collections.abc import Sequence
 from prettytable import PrettyTable
+from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
@@ -564,15 +563,10 @@ class RecorderManager(ManagerBase):
                 "export_in_close",
             ]:
                 continue
-            # check if term config is None
-            if term_cfg is None:
+            # check if term config is None or not a RecorderTermCfg
+            # Skip non-RecorderTermCfg values (allows custom attributes in subclasses)
+            if term_cfg is None or not isinstance(term_cfg, RecorderTermCfg):
                 continue
-            # check valid type
-            if not isinstance(term_cfg, RecorderTermCfg):
-                raise TypeError(
-                    f"Configuration for the term '{term_name}' is not of type RecorderTermCfg."
-                    f" Received: '{type(term_cfg)}'."
-                )
             # create the recorder term
             term = term_cfg.class_type(term_cfg, self._env)
             # sanity check if term is valid type

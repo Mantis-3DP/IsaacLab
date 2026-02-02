@@ -6,8 +6,9 @@
 Script to record demonstrations with Isaac Lab environments using human teleoperation.
 
 This script allows users to record demonstrations operated by human teleoperation for a specified task.
-The recorded demonstrations are stored as episodes in a hdf5 file. Users can specify the task, teleoperation
-device, dataset directory, and environment stepping rate through command-line arguments.
+The recorded demonstrations are stored as episodes in HDF5 or JPEG/JSON format (streaming recorder).
+Users can specify the task, teleoperation device, dataset directory, and environment stepping rate
+through command-line arguments.
 
 required arguments:
     --task                    Name of the task.
@@ -15,7 +16,8 @@ required arguments:
 optional arguments:
     -h, --help                Show this help message and exit
     --teleop_device           Device for interacting with environment. (default: keyboard)
-    --dataset_file            File path to export recorded demos. (default: "./datasets/dataset.hdf5")
+    --dataset_file            File path to export recorded demos as HDF5. (default: "./datasets/dataset.hdf5")
+    --output_dir              Output directory for streaming recorder (JPEG/JSON). Overrides --dataset_file.
     --step_hz                 Environment stepping rate in Hz. (default: 30)
     --num_demos               Number of demonstrations to record. (default: 0)
     --num_success_steps       Number of continuous steps with task success for concluding a demo as successful.
@@ -45,7 +47,13 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
+    "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos (HDF5)."
+)
+parser.add_argument(
+    "--output_dir",
+    type=str,
+    default=None,
+    help="Output directory for streaming recorder (JPEG/JSON). Overrides --dataset_file directory if set.",
 )
 parser.add_argument("--step_hz", type=int, default=30, help="Environment stepping rate in Hz.")
 parser.add_argument(
@@ -91,11 +99,10 @@ simulation_app = app_launcher.app
 
 
 # Third-party imports
+import gymnasium as gym
 import logging
 import os
 import time
-
-import gymnasium as gym
 import torch
 
 import omni.ui as ui
@@ -108,13 +115,15 @@ import isaaclab_mimic.envs  # noqa: F401
 from isaaclab_mimic.ui.instruction_display import InstructionDisplay, show_subtask_instructions
 
 if args_cli.enable_pinocchio:
-    import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
     import isaaclab_tasks.manager_based.manipulation.pick_place  # noqa: F401
+    import isaaclab_tasks.manager_based.manipulation.pick_place_target  # noqa: F401
+    import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
 
 from collections.abc import Callable
 
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
+from isaaclab.envs.mdp.recorders import StreamingRecorderManagerCfg
 from isaaclab.envs.ui import EmptyWindow
 from isaaclab.managers import DatasetExportMode
 
@@ -169,9 +178,22 @@ def setup_output_directories() -> tuple[str, str]:
             - output_dir: The directory path where the dataset will be saved
             - output_file_name: The filename (without extension) for the dataset
     """
-    # get directory path and file name (without extension) from cli arguments
-    output_dir = os.path.dirname(args_cli.dataset_file)
-    output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+    # Use --output_dir if provided, otherwise extract from --dataset_file
+    if args_cli.output_dir:
+        output_dir = args_cli.output_dir
+        output_file_name = "dataset"  # Default name for streaming recorder
+    else:
+        # For HDF5: dataset_file is the full path including filename
+        # For streaming: dataset_file is treated as the output directory
+        # Check if path looks like a file (has extension) or directory
+        if os.path.splitext(args_cli.dataset_file)[1]:
+            # Has extension - treat as HDF5 file path
+            output_dir = os.path.dirname(args_cli.dataset_file)
+            output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+        else:
+            # No extension - treat as directory path (for streaming recorder)
+            output_dir = args_cli.dataset_file
+            output_file_name = "dataset"
 
     # create directory if it does not exist
     if not os.path.exists(output_dir):
@@ -231,10 +253,20 @@ def create_environment_config(
     env_cfg.terminations.time_out = None
     env_cfg.observations.policy.concatenate_terms = False
 
-    env_cfg.recorders: ActionStateRecorderManagerCfg = ActionStateRecorderManagerCfg()
-    env_cfg.recorders.dataset_export_dir_path = output_dir
-    env_cfg.recorders.dataset_filename = output_file_name
-    env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+    # Check if env already has a StreamingRecorderManagerCfg configured
+    # If so, preserve it and just update the output path
+    if hasattr(env_cfg, "recorders") and isinstance(env_cfg.recorders, StreamingRecorderManagerCfg):
+        print("[record_demos] Using StreamingRecorderManagerCfg from env config")
+        env_cfg.recorders.dataset_export_dir_path = output_dir
+        # Also update the nested streaming_recorder.task_dir (set during __post_init__)
+        if env_cfg.recorders.streaming_recorder is not None:
+            env_cfg.recorders.streaming_recorder.task_dir = output_dir
+    else:
+        # Use default HDF5-based recorder
+        env_cfg.recorders: ActionStateRecorderManagerCfg = ActionStateRecorderManagerCfg()
+        env_cfg.recorders.dataset_export_dir_path = output_dir
+        env_cfg.recorders.dataset_filename = output_file_name
+        env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
 
     return env_cfg, success_term
 
@@ -359,6 +391,13 @@ def process_success_condition(env: gym.Env, success_term: object | None, success
                 [0], torch.tensor([[True]], dtype=torch.bool, device=env.device)
             )
             env.recorder_manager.export_episodes([0])
+
+            # For streaming recorder: the counter is already updated in StreamingRecorder.record_pre_reset()
+            # Just print the success message here
+            if isinstance(env_cfg.recorders, StreamingRecorderManagerCfg):
+                rm = env.recorder_manager
+                print(f"[StreamingRecorder] Episode saved successfully. Total: {rm.exported_successful_episode_count}")
+
             print("Success condition met! Recording completed.")
             return success_step_count, True
     else:
@@ -554,7 +593,11 @@ def main() -> None:
     # Clean up
     env.close()
     print(f"Recording session completed with {current_recorded_demo_count} successful demonstrations")
-    print(f"Demonstrations saved to: {args_cli.dataset_file}")
+    # Show correct output path based on recorder type
+    if isinstance(env_cfg.recorders, StreamingRecorderManagerCfg):
+        print(f"Demonstrations saved to: {output_dir}/ (JPEG/JSON)")
+    else:
+        print(f"Demonstrations saved to: {args_cli.dataset_file}")
 
 
 if __name__ == "__main__":

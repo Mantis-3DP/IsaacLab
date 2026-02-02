@@ -145,7 +145,7 @@ def remove_camera_configs(env_cfg: Any) -> Any:
                     if hasattr(obsterm, "params") and obsterm.params:
                         for param_value in obsterm.params.values():
                             if isinstance(param_value, SceneEntityCfg) and param_value.name == attr_name:
-                                delattr(env_cfg.observations.policy, attr_name)
-                                logger.info(f"Removed camera observation term: {attr_name}")
+                                delattr(env_cfg.observations.policy, obs_name)
+                                logger.info(f"Removed camera observation term: {obs_name}")
                                 break
     return env_cfg

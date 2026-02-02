@@ -11,9 +11,8 @@ the termination introduced by the function.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
+from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
@@ -89,5 +88,7 @@ def cubes_stacked(
             )
         else:
             raise ValueError("No gripper_joint_names found in environment config")
+        
+        
 
     return stacked

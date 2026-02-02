@@ -11,9 +11,8 @@ the termination introduced by the function.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
+from typing import TYPE_CHECKING
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
@@ -121,3 +120,71 @@ def object_a_is_into_b(
             raise ValueError("No gripper_joint_names found in environment config")
 
     return success
+
+
+def cube_in_target_zone(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    cube_cfg: SceneEntityCfg = SceneEntityCfg("cube_1"),
+    target_x: tuple[float, float] = (-4.35, -4.25),
+    target_y: tuple[float, float] = (-3.85, -3.75),
+    atol=0.0001,
+    rtol=0.0001,
+) -> torch.Tensor:
+    """Check if cube is placed in target zone and optionally if arms are at rest.
+
+    Args:
+        env: The environment instance.
+        robot_cfg: Configuration for the robot.
+        cube_cfg: Configuration for the cube.
+        target_x: X bounds (min, max) of target zone.
+        target_y: Y bounds (min, max) of target zone.
+        check_arms_at_rest: Whether to also check if arms returned to rest position.
+        arm_rest_threshold: Max deviation from rest position (radians).
+
+    Returns:
+        Boolean tensor indicating success for each environment.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    cube: RigidObject = env.scene[cube_cfg.name]
+
+    # Check cube is in target zone
+    cube_pos = cube.data.root_pos_w
+    x_ok = (target_x[0] <= cube_pos[:, 0]) & (cube_pos[:, 0] <= target_x[1])
+    y_ok = (target_y[0] <= cube_pos[:, 1]) & (cube_pos[:, 1] <= target_y[1])
+    in_zone = x_ok & y_ok
+
+    # Check gripper positions
+    if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:
+        surface_gripper = env.scene.surface_grippers["surface_gripper"]
+        suction_cup_status = surface_gripper.state.view(-1, 1)  # 1: closed, 0: closing, -1: open
+        suction_cup_is_open = (suction_cup_status == -1).to(torch.float32)
+        in_zone = torch.logical_and(suction_cup_is_open, in_zone)
+
+    else:
+        if hasattr(env.cfg, "gripper_joint_names"):
+            gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
+            assert len(gripper_joint_ids) == 2, "Terminations only support parallel gripper for now"
+
+            in_zone = torch.logical_and(
+                torch.isclose(
+                    robot.data.joint_pos[:, gripper_joint_ids[0]],
+                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                    atol=atol,
+                    rtol=rtol,
+                ),
+                in_zone,
+            )
+            in_zone = torch.logical_and(
+                torch.isclose(
+                    robot.data.joint_pos[:, gripper_joint_ids[1]],
+                    torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32).to(env.device),
+                    atol=atol,
+                    rtol=rtol,
+                ),
+                in_zone,
+            )
+        else:
+            raise ValueError("No gripper_joint_names found in environment config")
+
+    return in_zone

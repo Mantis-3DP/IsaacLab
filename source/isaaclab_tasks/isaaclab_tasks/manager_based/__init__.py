@@ -8,3 +8,6 @@ Config-based workflow environments.
 """
 
 import gymnasium as gym
+
+# Import locomanipulation tasks to register them with gym
+from .locomanipulation.pick_place import *

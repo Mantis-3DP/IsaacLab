@@ -6,3 +6,5 @@
 
 from .recorders import *
 from .recorders_cfg import *
+from .streaming_recorder import StreamingRecorder, StreamingRecorderCfg
+from .streaming_recorder_manager_cfg import StreamingRecorderManagerCfg

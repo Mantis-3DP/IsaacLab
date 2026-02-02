@@ -94,6 +94,16 @@ RUN --mount=type=cache,target=${DOCKER_USER_HOME}/.cache/pip \
 # HACK: Remove install of quadprog dependency
 RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip uninstall -y quadprog
 
+# FIX: Isaac Sim 5.1.0 setup_python_env.sh doesn't include extscache paths
+# Patch the setup_python_env.sh to add missing PYTHONPATH and LD_LIBRARY_PATH entries
+RUN echo "" >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo "# Added by IsaacLab Dockerfile - fix for Isaac Sim 5.1.0 missing paths" >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo 'EXTSCACHE_DIRS=$(find ${SCRIPT_DIR}/extscache -maxdepth 1 -type d 2>/dev/null | tr "\n" ":")' >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo 'export PYTHONPATH="${EXTSCACHE_DIRS}${PYTHONPATH}"' >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo 'for dir in ${SCRIPT_DIR}/extscache/*/bin; do [ -d "$dir" ] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${dir}"; done' >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo '# Add cmeel.prefix/lib for pinocchio dependencies (tinyxml, urdfdom, etc.)' >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh && \
+    echo 'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${SCRIPT_DIR}/kit/python/lib/python3.11/site-packages/cmeel.prefix/lib"' >> ${ISAACSIM_ROOT_PATH}/setup_python_env.sh
+
 # aliasing isaaclab.sh and python for convenience
 RUN echo "export ISAACLAB_PATH=${ISAACLAB_PATH}" >> ${HOME}/.bashrc && \
     echo "alias isaaclab=${ISAACLAB_PATH}/isaaclab.sh" >> ${HOME}/.bashrc && \
