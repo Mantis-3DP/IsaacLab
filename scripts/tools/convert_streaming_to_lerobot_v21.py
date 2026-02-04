@@ -202,7 +202,6 @@ def convert_episode(
     skip_videos: bool,
     global_frame_idx_start: int,
     task_index: int = 0,
-    use_next_state_as_action: bool = False,
 ) -> tuple[dict, int, set]:
     """Convert a single episode to LeRobot v2.1 format.
 
@@ -275,14 +274,8 @@ def convert_episode(
 
     frame_data["observation.state"] = states_list
 
-    # Optionally shift actions: action[t] = state[t+1] for RELATIVE training
-    # This ensures the model learns actual motion deltas instead of near-zero deltas
-    if use_next_state_as_action and len(states_list) > 1:
-        # action[t] = state[t+1], last action = last state (repeat)
-        shifted_actions = states_list[1:] + [states_list[-1]]
-        frame_data["action"] = shifted_actions
-    else:
-        frame_data["action"] = actions_list
+    # Always use real commanded actions from StreamingRecorder
+    frame_data["action"] = actions_list
 
     # Encode videos
     if not skip_videos:
@@ -314,9 +307,6 @@ def main():
     parser.add_argument("--skip-videos", action="store_true", help="Skip video encoding (for testing)")
     parser.add_argument("--force", "-f", action="store_true", help="Overwrite existing output")
     parser.add_argument("--max-episodes", type=int, default=None, help="Limit number of episodes (for testing)")
-    parser.add_argument("--use-next-state-as-action", action="store_true",
-                        help="Use state[t+1] as action[t] for RELATIVE action training. "
-                             "This ensures action-state deltas represent actual motion.")
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser()
@@ -370,7 +360,6 @@ def main():
             skip_videos=args.skip_videos,
             global_frame_idx_start=global_frame_idx,
             task_index=0,
-            use_next_state_as_action=args.use_next_state_as_action,
         )
 
         if num_frames > 0:
