@@ -620,13 +620,6 @@ def main():
                 # Execute control step
                 controller.step()
 
-                # Print statistics periodically
-                if current_time - last_stats_time >= args_cli.stats_interval:
-                    elapsed_time = current_time - loop_start_time
-                    loop_frequency = loop_count / elapsed_time if elapsed_time > 0 else 0
-                    print(f"[Stats] Loop frequency: {loop_frequency:.1f} Hz, Total steps: {loop_count}")
-                    last_stats_time = current_time
-
                 # Check if simulation stopped
                 if env.sim.is_stopped():
                     print("Simulation stopped")

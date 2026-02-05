@@ -103,6 +103,24 @@ ISAACLAB_TO_UNITREE_HAND = {
 }
 
 
+def normalize_camera_key(cam_key: str) -> str:
+    """Normalize camera key to standard format (cam_left, cam_right).
+
+    Maps various naming conventions to consistent cam_left/cam_right:
+    - head_rgb_left -> cam_left
+    - head_rgb_right -> cam_right
+    - cam_left -> cam_left (unchanged)
+    """
+    key_lower = cam_key.lower()
+    if "left" in key_lower:
+        return "cam_left"
+    elif "right" in key_lower:
+        return "cam_right"
+    else:
+        # Fallback: clean up the key
+        return cam_key.replace("head_rgb_", "").replace("_rgb", "")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert Isaac Lab HDF5 demos to LeRobot v2.1 format for GR00T"
@@ -256,9 +274,10 @@ def create_directory_structure(output_dir, camera_keys, force=False):
     (output_path / "meta").mkdir(parents=True)
     (output_path / "data" / "chunk-000").mkdir(parents=True)
 
-    # Create video directories for each camera
+    # Create video directories for each camera (use normalized keys)
     for cam_key in camera_keys:
-        video_key = f"observation.images.{cam_key}"
+        normalized_key = normalize_camera_key(cam_key)
+        video_key = f"observation.images.{normalized_key}"
         (output_path / "videos" / "chunk-000" / video_key).mkdir(parents=True)
 
     return output_path
@@ -322,9 +341,16 @@ def convert_episode(
     }
 
     # Build concatenated observation.state array
-    # For G1 Inspire: robot_joint_pos (53)
+    # For Unitree G1 Inspire 26 DOF: use robot_joint_pos_26dof if available, else convert from 53 DOF
+    # Check obs_group directly since different demos may have different keys
     state_arrays = []
-    if "robot_joint_pos" in state_keys:
+    if unitree_g1_inspire:
+        if "robot_joint_pos_26dof" in obs_group:
+            state_arrays.append(obs_group["robot_joint_pos_26dof"][:])
+        elif "robot_joint_pos" in obs_group:
+            state_53 = obs_group["robot_joint_pos"][:]
+            state_arrays.append(ensure_26dof_state(state_53))
+    elif "robot_joint_pos" in obs_group:
         state_arrays.append(obs_group["robot_joint_pos"][:])
 
     if state_arrays:
@@ -341,19 +367,14 @@ def convert_episode(
     # Build concatenated action array
     if unitree_g1_inspire:
         # Convert to Unitree G1 Inspire 26 DOF format
-        if "actions" in demo_group and "processed_actions" in demo_group:
-            actions_38d = demo_group["actions"][:]
-            processed_actions = demo_group["processed_actions"][:]
-            actions = convert_to_unitree_26dof(actions_38d, processed_actions)
-        elif "processed_actions" in demo_group:
-            # Fallback: use processed_actions directly (already IK-solved)
-            processed_actions = demo_group["processed_actions"][:]
-            # Try to get hand joints from actions if available
-            if "actions" in demo_group:
-                actions_38d = demo_group["actions"][:]
-                actions = convert_to_unitree_26dof(actions_38d, processed_actions)
-            else:
-                actions = processed_actions[:, :26]  # Take first 26 if no raw actions
+        # Handle both already-26DOF and 38DOF formats
+        proc_actions = demo_group["processed_actions"][:] if "processed_actions" in demo_group else None
+        raw_actions = demo_group["actions"][:] if "actions" in demo_group else None
+
+        if proc_actions is not None:
+            actions = ensure_26dof_actions(proc_actions, proc_actions)
+        elif raw_actions is not None:
+            actions = ensure_26dof_actions(raw_actions)
         else:
             actions = None
     else:
@@ -376,14 +397,15 @@ def convert_episode(
     # Add success indicator
     frame_data["next.success"] = np.full(num_frames, is_success, dtype=bool)
 
-    # Process camera observations
+    # Process camera observations (use normalized keys for consistency)
     video_info = {}
     if not skip_videos and camera_keys:
         for cam_key in camera_keys:
             cam_frames = obs_group[cam_key][:]
-            video_key = f"observation.images.{cam_key}"
+            normalized_key = normalize_camera_key(cam_key)
+            video_key = f"observation.images.{normalized_key}"
 
-            # Video path: videos/chunk-000/observation.images.<cam>/episode_000000.mp4
+            # Video path: videos/chunk-000/observation.images.cam_left/episode_000000.mp4
             video_path = output_path / "videos" / "chunk-000" / video_key / f"episode_{episode_idx:06d}.mp4"
 
             encode_video(
@@ -394,7 +416,7 @@ def convert_episode(
                 video_quality
             )
 
-            # Store video info
+            # Store video info (use normalized key)
             video_info[video_key] = {
                 "height": cam_frames.shape[1],
                 "width": cam_frames.shape[2],
@@ -420,7 +442,79 @@ def convert_episode(
     }
 
 
-def compute_statistics(hdf5_file, demo_keys):
+def ensure_26dof_state(state):
+    """Ensure state is 26 DOF format (14 arm + 12 hand).
+
+    Handles both:
+    - Already 26 DOF: return as-is
+    - 53 DOF format: extract arm and hand joints
+    """
+    if state.shape[1] == 26:
+        return state
+    elif state.shape[1] == 53:
+        # Extract from 53 DOF state using G1_JOINT_GROUPS
+        # Arms: left_arm (17-24) + right_arm (24-31) = 14 joints
+        left_arm = state[:, 17:24]   # 7 joints
+        right_arm = state[:, 24:31]  # 7 joints
+
+        # Hands: map 11 joints each to 6 drive joints
+        left_hand_11 = state[:, 31:42]
+        right_hand_11 = state[:, 42:53]
+
+        # 6 DOF hand: pinky, ring, middle, index, thumb_bend, thumb_rot
+        left_hand_6 = np.column_stack([
+            left_hand_11[:, 2],  # pinky
+            left_hand_11[:, 3],  # ring
+            left_hand_11[:, 1],  # middle
+            left_hand_11[:, 0],  # index
+            left_hand_11[:, 5],  # thumb_bend
+            left_hand_11[:, 4],  # thumb_rot
+        ])
+        right_hand_6 = np.column_stack([
+            right_hand_11[:, 2],
+            right_hand_11[:, 3],
+            right_hand_11[:, 1],
+            right_hand_11[:, 0],
+            right_hand_11[:, 5],
+            right_hand_11[:, 4],
+        ])
+
+        return np.concatenate([left_arm, right_arm, left_hand_6, right_hand_6], axis=1)
+    else:
+        return state
+
+
+def ensure_26dof_actions(actions, processed_actions=None):
+    """Ensure actions are 26 DOF format (14 arm + 12 hand).
+
+    Handles both:
+    - Already 26 DOF: return as-is
+    - 38 DOF format: extract 14 arm joints + remap 24→12 hand joints
+    """
+    if actions.shape[1] == 26:
+        return actions
+    elif actions.shape[1] == 38:
+        # 38 DOF: first 14 are arm EEF poses (or IK-solved joints), last 24 are hand
+        if processed_actions is not None and processed_actions.shape[1] >= 14:
+            arm_joints = processed_actions[:, :14]
+        else:
+            # Fallback: use first 14 from actions (EEF poses - not ideal)
+            arm_joints = actions[:, :14]
+
+        # Remap 24 hand joints to 12 drive joints
+        hand_24 = actions[:, 14:]
+        hand_12 = np.zeros((len(hand_24), 12))
+        for il_idx, ut_idx in ISAACLAB_TO_UNITREE_HAND.items():
+            if il_idx < hand_24.shape[1]:
+                hand_12[:, ut_idx] = hand_24[:, il_idx]
+
+        return np.concatenate([arm_joints, hand_12], axis=1)
+    else:
+        # Unknown format, return as-is
+        return actions
+
+
+def compute_statistics(hdf5_file, demo_keys, unitree_g1_inspire=False):
     """Compute dataset statistics for normalization."""
     all_actions = []
     all_states = []
@@ -430,13 +524,33 @@ def compute_statistics(hdf5_file, demo_keys):
         obs_group = demo_group["obs"]
 
         # Collect actions
-        if "actions" in demo_group:
+        if unitree_g1_inspire:
+            # Get both arrays if available
+            proc_actions = demo_group["processed_actions"][:] if "processed_actions" in demo_group else None
+            raw_actions = demo_group["actions"][:] if "actions" in demo_group else proc_actions
+
+            if proc_actions is not None:
+                actions = ensure_26dof_actions(proc_actions, proc_actions)
+            elif raw_actions is not None:
+                actions = ensure_26dof_actions(raw_actions)
+            else:
+                actions = None
+
+            if actions is not None:
+                all_actions.append(actions)
+        elif "actions" in demo_group:
             all_actions.append(demo_group["actions"][:])
         elif "processed_actions" in demo_group:
             all_actions.append(demo_group["processed_actions"][:])
 
-        # Collect states
-        if "robot_joint_pos" in obs_group:
+        # Collect states (use robot_joint_pos_26dof for Unitree mode, or convert from 53 DOF)
+        if unitree_g1_inspire:
+            if "robot_joint_pos_26dof" in obs_group:
+                all_states.append(obs_group["robot_joint_pos_26dof"][:])
+            elif "robot_joint_pos" in obs_group:
+                state_53 = obs_group["robot_joint_pos"][:]
+                all_states.append(ensure_26dof_state(state_53))
+        elif "robot_joint_pos" in obs_group:
             all_states.append(obs_group["robot_joint_pos"][:])
 
     stats = {}
@@ -479,8 +593,16 @@ def create_modality_json(output_path, camera_keys, action_dim, state_dim, unitre
         }
     }
 
-    # Map state groups (G1 with 53 DOF)
-    if state_dim >= 53:
+    # Map state groups
+    if unitree_g1_inspire:
+        # Use Unitree G1 Inspire 26 DOF groups for state (same as action)
+        for group_name, group_info in UNITREE_G1_INSPIRE_ACTION_GROUPS.items():
+            modality["state"][group_name] = {
+                "start": group_info["start"],
+                "end": group_info["end"]
+            }
+    elif state_dim >= 53:
+        # Use full G1 53 DOF joint groups
         for group_name, group_info in G1_JOINT_GROUPS.items():
             modality["state"][group_name] = {
                 "start": group_info["start"],
@@ -509,17 +631,17 @@ def create_modality_json(output_path, camera_keys, action_dim, state_dim, unitre
         # Fallback: treat as single group
         modality["action"]["joints"] = {"start": 0, "end": action_dim}
 
-    # Map camera keys
+    # Map camera keys to GR00T-compatible names (using normalized keys)
+    # head_rgb_left -> cam_left, head_rgb_right -> cam_right
     for cam_key in camera_keys:
-        video_key = f"observation.images.{cam_key}"
-        # Create alias without special characters
-        alias = cam_key.replace("_", ".")
-        modality["video"][alias] = {
+        normalized_key = normalize_camera_key(cam_key)
+        video_key = f"observation.images.{normalized_key}"
+        modality["video"][normalized_key] = {
             "original_key": video_key
         }
 
     with open(output_path / "meta" / "modality.json", "w") as f:
-        json.dump(modality, f, indent=2)
+        json.dump(modality, f, indent=4)
 
 
 def numpy_to_python(obj):
@@ -602,9 +724,10 @@ def create_metadata_files(
             "names": state_names[:state_dim]
         }
 
-    # Add camera features
+    # Add camera features (use normalized keys)
     for cam_key in camera_keys:
-        video_key = f"observation.images.{cam_key}"
+        normalized_key = normalize_camera_key(cam_key)
+        video_key = f"observation.images.{normalized_key}"
         info = video_info.get(video_key, {"height": 200, "width": 200, "channels": 3})
         features[video_key] = {
             "dtype": "video",
@@ -717,7 +840,12 @@ def main():
             action_dim = 26  # Unitree G1 Inspire: 14 arm + 12 hand
         else:
             action_dim = hdf5_file[f"data/{demo_keys[0]}/actions"].shape[1]
-        state_dim = hdf5_file[f"data/{demo_keys[0]}/obs/robot_joint_pos"].shape[1] if "robot_joint_pos" in state_keys else 0
+        if unitree_mode and "robot_joint_pos_26dof" in state_keys:
+            state_dim = hdf5_file[f"data/{demo_keys[0]}/obs/robot_joint_pos_26dof"].shape[1]
+        elif "robot_joint_pos" in state_keys:
+            state_dim = hdf5_file[f"data/{demo_keys[0]}/obs/robot_joint_pos"].shape[1]
+        else:
+            state_dim = 0
         print(f"Action dimension: {action_dim}" + (" (Unitree 26 DOF)" if unitree_mode else ""))
         print(f"State dimension: {state_dim}")
 
@@ -727,7 +855,7 @@ def main():
 
         # Compute statistics
         print("\nComputing dataset statistics...")
-        stats = compute_statistics(hdf5_file, demo_keys)
+        stats = compute_statistics(hdf5_file, demo_keys, unitree_g1_inspire=unitree_mode)
 
         # Get task description
         task_desc = args.task_description or env_info.get("env_name", "manipulation_task")

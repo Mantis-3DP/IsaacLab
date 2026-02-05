@@ -225,6 +225,9 @@ class G1InspirePickPlaceTargetEnvCfg(StackEnvCfg):
         # Call parent post_init first
         super().__post_init__()
 
+        # Increase env spacing for warehouse environment (default 2.5 is too small)
+        self.scene.env_spacing = 7.0
+
         # Set events for pick-place-target task
         self.events = PickPlaceTargetEventCfg()
 

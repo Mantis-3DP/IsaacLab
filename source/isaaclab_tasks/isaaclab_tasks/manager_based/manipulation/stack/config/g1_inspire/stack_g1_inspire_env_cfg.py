@@ -39,6 +39,7 @@ from isaaclab.utils import configclass
 from isaaclab_tasks.manager_based.manipulation.stack import mdp
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
 from isaaclab_tasks.manager_based.manipulation.stack.stack_env_cfg import StackEnvCfg
+from isaaclab_tasks.manager_based.manipulation.pick_place import mdp as pick_place_mdp
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 from isaaclab_assets.robots.unitree import G1_INSPIRE_FTP_CFG  # isort: skip
@@ -72,6 +73,11 @@ class G1ObservationsCfg:
         # End-effector observations
         eef_pos = ObsTerm(func=mdp.ee_frame_pos)
         eef_quat = ObsTerm(func=mdp.ee_frame_quat)
+        # Separate left/right EEF observations (for mimic env)
+        left_eef_pos = ObsTerm(func=pick_place_mdp.get_eef_pos, params={"link_name": "left_wrist_yaw_link"})
+        left_eef_quat = ObsTerm(func=pick_place_mdp.get_eef_quat, params={"link_name": "left_wrist_yaw_link"})
+        right_eef_pos = ObsTerm(func=pick_place_mdp.get_eef_pos, params={"link_name": "right_wrist_yaw_link"})
+        right_eef_quat = ObsTerm(func=pick_place_mdp.get_eef_quat, params={"link_name": "right_wrist_yaw_link"})
         # Camera observations (head stereo cameras) - normalize=False for raw RGB [0,1]
         head_rgb_left = ObsTerm(
             func=base_mdp.image,
@@ -207,6 +213,9 @@ class G1InspireCubeStackEnvCfg(StackEnvCfg):
     def __post_init__(self):
         # Call parent post_init first
         super().__post_init__()
+
+        # Increase env spacing for warehouse environment (default 2.5 is too small)
+        self.scene.env_spacing = 15.0
 
         # Set events for G1
         self.events = EventCfg()
@@ -584,4 +593,5 @@ class G1InspireCubeStackEnvCfg(StackEnvCfg):
             enable_rerun=True,
             jpeg_quality=95,
             frequency=20.0,  # Match control rate: 120Hz / 6 decimation = 20Hz
+            capture_scene_state=True,  # Enable for mimic annotation (captures object poses)
         )

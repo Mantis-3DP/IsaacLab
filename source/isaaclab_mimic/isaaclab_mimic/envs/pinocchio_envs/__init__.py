@@ -58,3 +58,12 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+gym.register(
+    id="Isaac-Stack-G1-Inspire-Mimic-v0",
+    entry_point=f"{__name__}.pick_place_target_g1_inspire_mimic_env:PickPlaceTargetG1InspireMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_g1_inspire_mimic_env_cfg:StackG1InspireMimicEnvCfg",
+    },
+    disable_env_checker=True,
+)
