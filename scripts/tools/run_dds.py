@@ -64,11 +64,12 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import contextlib
 import signal
+import threading
 import time
 
 import gymnasium as gym
+import numpy as np
 import torch
 
 # Add unitree_sim_isaaclab to path for DDS imports
@@ -83,7 +84,6 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 # DDS imports from unitree_sim_isaaclab
 from dds.dds_create import create_dds_objects
 from teleimager.image_server import ImageServer
-from layeredcontrol.robot_control_system import RobotController, ControlConfig
 from action_provider.create_action_provider import create_action_provider
 from dds.reset_pose_dds import *
 from dds.sim_state_dds import *
@@ -174,35 +174,46 @@ def make_dds_compatible(env_cfg):
 
     Modifications:
     1. Replace PinkInverseKinematicsActionCfg with JointPositionActionCfg
-    2. Disable streaming recorders (avoid permission errors)
-    3. Keep all scene/observations/terminations intact
+    2. Ensure all JointPositionActionCfg use use_default_offset=False
+       (DDS sends absolute positions, not deltas from default pose)
+    3. Disable streaming recorders (avoid permission errors)
+    4. Keep all scene/observations/terminations intact
     """
     from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 
-    # Check and replace IK with direct joint position control
     if hasattr(env_cfg, 'actions'):
-        if hasattr(env_cfg.actions, 'arm_action'):
-            action_type = type(env_cfg.actions.arm_action).__name__
+        # Collect attribute names robustly: vars() for instance attrs + dir() for configclass fields
+        attr_names = set()
+        if hasattr(env_cfg.actions, '__dict__'):
+            attr_names.update(vars(env_cfg.actions).keys())
+        for name in dir(env_cfg.actions):
+            if not name.startswith('_') and name not in ('to_dict', 'from_dict', 'replace', 'copy', 'validate'):
+                attr_names.add(name)
+
+        print(f"[DDS] Scanning action attributes: {sorted(attr_names)}")
+
+        for attr_name in attr_names:
+            action_cfg = getattr(env_cfg.actions, attr_name, None)
+            if action_cfg is None or callable(action_cfg):
+                continue
+
+            action_type = type(action_cfg).__name__
+
+            # Replace IK actions with direct joint position control
             if 'InverseKinematics' in action_type or 'Pink' in action_type:
-                print(f"[DDS] Converting {action_type} → JointPositionActionCfg")
-                env_cfg.actions.arm_action = JointPositionActionCfg(
+                print(f"[DDS] Converting {attr_name}: {action_type} → JointPositionActionCfg")
+                setattr(env_cfg.actions, attr_name, JointPositionActionCfg(
                     asset_name="robot",
                     joint_names=[".*"],
                     scale=1.0,
                     use_default_offset=False,
-                )
+                ))
 
-        # Also check for generic 'action' attribute
-        if hasattr(env_cfg.actions, 'action'):
-            action_type = type(env_cfg.actions.action).__name__
-            if 'InverseKinematics' in action_type or 'Pink' in action_type:
-                print(f"[DDS] Converting {action_type} → JointPositionActionCfg")
-                env_cfg.actions.action = JointPositionActionCfg(
-                    asset_name="robot",
-                    joint_names=[".*"],
-                    scale=1.0,
-                    use_default_offset=True,
-                )
+            # Ensure existing JointPositionActionCfg uses absolute positions
+            elif 'JointPosition' in action_type:
+                if getattr(action_cfg, 'use_default_offset', False):
+                    print(f"[DDS] Fixing {attr_name}: use_default_offset=True → False (DDS sends absolute positions)")
+                    action_cfg.use_default_offset = False
 
     # Disable streaming recorders to avoid permission errors
     if hasattr(env_cfg, 'recorders'):
@@ -211,6 +222,37 @@ def make_dds_compatible(env_cfg):
             env_cfg.recorders = None
 
     return env_cfg
+
+
+def zero_action_offsets(env):
+    """Zero out action manager offsets for DDS absolute position control.
+
+    DDS sends absolute joint positions, not deltas from default pose.
+    The action manager's use_default_offset adds default_joint_pos to
+    every action, corrupting absolute positions. This runtime fix
+    zeroes the offset after env creation, bypassing config propagation issues.
+    """
+    try:
+        for name, term in env.action_manager._terms.items():
+            if hasattr(term, '_offset'):
+                offset = term._offset
+                if isinstance(offset, torch.Tensor):
+                    max_offset = offset.abs().max().item()
+                    if max_offset > 0.001:
+                        print(f"[DDS] Zeroing action offset for '{name}': "
+                              f"max|offset|={max_offset:.4f} (was use_default_offset=True)")
+                        term._offset.zero_()
+                    else:
+                        print(f"[DDS] Action offset for '{name}' already zero")
+                elif isinstance(offset, (int, float)) and abs(offset) > 0.001:
+                    print(f"[DDS] Zeroing scalar action offset for '{name}': {offset}")
+                    term._offset = 0.0
+                else:
+                    print(f"[DDS] Action offset for '{name}' already zero")
+    except Exception as e:
+        print(f"[DDS] Warning: Could not zero action offsets: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # SDK's expected joint order for G1_29 (29 body joints)
@@ -351,7 +393,6 @@ def publish_robot_state_to_dds(env, g1_robot_dds):
             print(f"[DDS] Error publishing robot state: {e}")
             publish_robot_state_to_dds._error_logged = True
 
-
 # Inspire hand joint order expected by SDK's DDS message
 # Order: Right hand (0-5), Left hand (6-11)
 # Each hand: pinky, ring, middle, index, thumb_pitch, thumb_yaw
@@ -452,29 +493,6 @@ def publish_inspire_state_to_dds(env, inspire_dds):
             publish_inspire_state_to_dds._error_logged = True
 
 
-def setup_signal_handlers(controller, dds_manager=None, image_server=None):
-    """Set up signal handlers for clean shutdown."""
-    def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}, stopping...")
-        try:
-            controller.stop()
-        except Exception as e:
-            print(f"Failed to stop controller: {e}")
-        try:
-            if dds_manager is not None:
-                dds_manager.stop_all_communication()
-        except Exception as e:
-            print(f"Failed to stop DDS: {e}")
-        try:
-            if image_server is not None:
-                image_server.stop()
-        except Exception as e:
-            print(f"Failed to stop image server: {e}")
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-
 def main():
     """Run the environment with DDS control."""
     print("=" * 60)
@@ -508,6 +526,9 @@ def main():
     env.sim.reset()
     env.reset()
 
+    # Zero out action offsets (DDS sends absolute positions, not deltas)
+    zero_action_offsets(env)
+
     # Create image server (auto-detects cameras from environment)
     print("\n[DDS] Creating image server...")
     try:
@@ -532,13 +553,7 @@ def main():
         print(f"Failed to create DDS: {e}")
         return
 
-    # Create control config
-    control_config = ControlConfig(
-        step_hz=args_cli.step_hz,
-        replay_mode=False
-    )
-
-    # Create action provider
+    # Create action provider (reads commands from DDS)
     print("\n[DDS] Creating action provider...")
     try:
         action_provider = create_action_provider(env, args_cli)
@@ -550,12 +565,48 @@ def main():
         print(f"Failed to create action provider: {e}")
         return
 
-    # Create controller
-    controller = RobotController(env, control_config)
-    controller.set_action_provider(action_provider)
+    # Get direct robot reference for bypassing action manager
+    robot = env.scene["robot"]
+    print(f"[DDS] Using direct joint control (bypassing action manager)")
+    print(f"[DDS] Robot has {len(robot.data.joint_names)} joints")
+
+    # Build integer index tensor of controlled joints from action provider's known indices
+    # Integer indexing works regardless of joint_names (53) vs joint_pos (57) size mismatch
+    # (some joints like spherical have multiple DOF per name, but arms/hands are all revolute)
+    controlled_indices = []
+    controlled_indices.append(action_provider._arm_target_idx_t)
+    if hasattr(action_provider, '_inspire_target_idx_t'):
+        controlled_indices.append(action_provider._inspire_target_idx_t)
+        controlled_indices.append(action_provider._inspire_special_target_idx_t)
+    if hasattr(action_provider, '_gripper_target_idx_t'):
+        controlled_indices.append(action_provider._gripper_target_idx_t)
+    if hasattr(action_provider, '_left_hand_target_idx_t'):
+        controlled_indices.append(action_provider._left_hand_target_idx_t)
+        controlled_indices.append(action_provider._right_hand_target_idx_t)
+    controlled_idx = torch.unique(torch.cat(controlled_indices))
+    print(f"[DDS] Controlling {len(controlled_idx)} of {robot.data.joint_pos.shape[-1]} DOFs (joint_names={len(robot.data.joint_names)})")
+
+    # Cache default standing pose in DOF space — used as baseline for ALL joints
+    # default_joint_pos is in joint space (53), but set_joint_position_target needs DOF space (57)
+    # Since defaults are all zeros for this URDF, create zeros in DOF space directly
+    num_dof = robot.data.joint_pos.shape[-1]
+    num_joints = len(robot.data.joint_names)
+    default_targets_dof = torch.zeros(num_dof, device=robot.device, dtype=robot.data.joint_pos.dtype)
+    print(f"[DDS] DOF space: {num_dof}, Joint space: {num_joints}")
+    print(f"[DDS] Default targets (standing pose): all zeros")
 
     # Set up signal handlers
-    setup_signal_handlers(controller, dds_manager, image_server)
+    _shutdown_flag = {"stop": False}
+
+    def signal_handler(signum, frame):
+        if _shutdown_flag["stop"]:
+            print("\nForce exit!")
+            os._exit(1)
+        print("\nShutting down gracefully... (press Ctrl+C again to force)")
+        _shutdown_flag["stop"] = True
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     print("\n" + "=" * 60)
     print("DDS control ready!")
@@ -564,16 +615,13 @@ def main():
     print("=" * 60 + "\n")
 
     try:
-        # Start controller
-        controller.start()
-
         # Main loop
         last_stats_time = time.time()
         loop_start_time = time.time()
         loop_count = 0
 
-        with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
-            while simulation_app.is_running() and controller.is_running:
+        with torch.inference_mode():
+            while simulation_app.is_running() and not _shutdown_flag["stop"]:
                 current_time = time.time()
                 loop_count += 1
 
@@ -608,17 +656,39 @@ def main():
                         reset_category = reset_pose_cmd.get("reset_category")
                         if reset_category == '1':
                             print("[DDS] Reset object requested")
-                            env_cfg.event_manager.trigger("reset_object_self", env)
+                            if hasattr(env_cfg, 'event_manager'):
+                                # Unitree-style: custom SimpleEventManager on config
+                                env_cfg.event_manager.trigger("reset_object_self", env)
+                            else:
+                                # IsaacLab-native: fall back to full env reset
+                                env.reset()
                             reset_pose_dds.write_reset_pose_command(-1)
                         elif reset_category == '2':
                             print("[DDS] Reset all requested")
-                            env_cfg.event_manager.trigger("reset_all_self", env)
+                            if hasattr(env_cfg, 'event_manager'):
+                                env_cfg.event_manager.trigger("reset_all_self", env)
+                            else:
+                                env.reset()
                             reset_pose_dds.write_reset_pose_command(-1)
                 except Exception as e:
                     print(f"Failed to process reset command: {e}")
 
-                # Execute control step
-                controller.step()
+                # Apply DDS action directly to robot (bypass action manager)
+                # This mirrors NVIDIA eval_groot_isaaclab.py approach:
+                # robot.set_joint_position_target() → write_data_to_sim() → sim.step()
+                # Start from default standing pose for ALL joints (prevents drift/leaning)
+                # Non-controlled joints (legs, waist) always held at default position
+                current_targets = default_targets_dof.clone()
+                action = action_provider.get_action(env)
+                if action is not None:
+                    action_flat = action.squeeze(0)
+                    current_targets[controlled_idx] = action_flat[controlled_idx]
+                robot.set_joint_position_target(current_targets.unsqueeze(0))
+                robot.write_data_to_sim()
+
+                # Step physics once (no decimation — matches NVIDIA eval)
+                env.sim.step(render=True)
+                env.scene.update(env.sim.get_physics_dt())
 
                 # Check if simulation stopped
                 if env.sim.is_stopped():
@@ -629,16 +699,50 @@ def main():
         print("\nUser interrupted")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         print("\nCleaning up...")
-        controller.cleanup()
+        if action_provider:
+            action_provider.cleanup()
+        dds_manager.stop_all_communication()
         image_server.stop()
         env.close()
         print("Cleanup completed")
+
+
+def _kill_descendants(pid):
+    """Recursively SIGKILL all descendant processes (children, grandchildren, ...)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-P', str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        for line in result.stdout.strip().split('\n'):
+            if line.strip():
+                child_pid = int(line.strip())
+                _kill_descendants(child_pid)
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
     try:
         main()
     finally:
-        simulation_app.close()
+        # simulation_app.close() can hang if Isaac Sim has lingering callbacks,
+        # so run it with a timeout and force-exit if it doesn't complete.
+        close_thread = threading.Thread(target=simulation_app.close, daemon=True)
+        close_thread.start()
+        close_thread.join(timeout=5.0)
+        if close_thread.is_alive():
+            print("simulation_app.close() timed out, forcing exit")
+        # Kill all descendant processes — Isaac Sim may spawn renderer/GPU
+        # subprocesses in separate process groups that survive os._exit().
+        _kill_descendants(os.getpid())
+        os._exit(0)
