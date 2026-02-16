@@ -99,6 +99,7 @@ simulation_app = app_launcher.app
 
 
 # Third-party imports
+import gc
 import gymnasium as gym
 import logging
 import os
@@ -494,6 +495,10 @@ def run_simulation_loop(
     instruction_display = setup_ui(label_text, env)
 
     subtasks = {}
+
+    # Disable automatic garbage collection to prevent periodic freezes during XR teleoperation.
+    # CPython reference counting still frees most objects immediately.
+    gc.disable()
 
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while simulation_app.is_running():

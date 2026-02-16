@@ -377,6 +377,10 @@ class StreamingEpisodeWriter:
         # Close JSON array
         with open(self.json_path, "a", encoding="utf-8") as f:
             f.write("\n],\n")
+            # Write episode metadata if set (joint groups, EEF links, etc.)
+            episode_metadata = getattr(self, "episode_metadata", None)
+            if episode_metadata:
+                f.write('"metadata": ' + json.dumps(episode_metadata, indent=4) + ',\n')
             # Add episode-level metadata (use proper JSON null for None)
             success = getattr(self, "episode_success", None)
             if success is None:

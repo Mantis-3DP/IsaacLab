@@ -7,14 +7,15 @@
 This recorder bypasses the normal EpisodeData accumulation and HDF5 batch writing,
 instead streaming images as JPEG and state/action data as incremental JSON.
 
-Output format is compatible with Unitree's unitree_IL_lerobot converter.
+Joint structure is discovered dynamically from the env's action terms at runtime,
+so it works with any robot (Inspire, TriHand, etc.) without hardcoded mappings.
 
 Benefits:
 - No memory buildup during recording
 - Near-instant episode saves (just close file handles)
 - 10-20x smaller storage via JPEG compression
 - Optional rerun.io live visualization
-- Direct compatibility with unitree_IL_lerobot converter
+- Robot-agnostic: discovers joint groups from Pink IK action term
 """
 
 from __future__ import annotations
@@ -32,62 +33,6 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
-# G1 Inspire joint indices in IsaacLab (from robot_joint_pos)
-# Order matches Pink IK processed_actions for consistency between state and action
-G1_INSPIRE_JOINT_MAPPING = {
-    # Left arm (7 DOF) - indices in robot_joint_pos
-    "left_arm": {
-        "joint_names": [
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "left_wrist_roll_joint",
-            "left_wrist_pitch_joint",
-            "left_wrist_yaw_joint",
-        ],
-        "indices": None,
-    },
-    # Right arm (7 DOF)
-    "right_arm": {
-        "joint_names": [
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-            "right_wrist_roll_joint",
-            "right_wrist_pitch_joint",
-            "right_wrist_yaw_joint",
-        ],
-        "indices": None,
-    },
-    # Left hand (6 DOF) - order matches Unitree/LeRobot format
-    # [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
-    "left_ee": {
-        "joint_names": [
-            "L_pinky_proximal_joint",
-            "L_ring_proximal_joint",
-            "L_middle_proximal_joint",
-            "L_index_proximal_joint",
-            "L_thumb_proximal_pitch_joint",
-            "L_thumb_proximal_yaw_joint",
-        ],
-        "indices": None,
-    },
-    # Right hand (6 DOF) - order matches Unitree/LeRobot format
-    "right_ee": {
-        "joint_names": [
-            "R_pinky_proximal_joint",
-            "R_ring_proximal_joint",
-            "R_middle_proximal_joint",
-            "R_index_proximal_joint",
-            "R_thumb_proximal_pitch_joint",
-            "R_thumb_proximal_yaw_joint",
-        ],
-        "indices": None,
-    },
-}
-
 # Camera name mapping: IsaacLab name -> Unitree format
 CAMERA_MAPPING = {
     "head_rgb_left": "color_0",
@@ -96,25 +41,6 @@ CAMERA_MAPPING = {
     "cam_right_high": "color_1",
     "cam_left_wrist": "color_2",
     "cam_right_wrist": "color_3",
-}
-
-# Fixed action indices for Pink IK controller's processed_actions
-# The Pink IK controller outputs: 14 arm joints + 24 hand joints = 38 total
-# Structure: [left_arm(7), right_arm(7), hand_joints(24)]
-#
-# Hand joint order in processed_actions (from env config hand_joint_names):
-#   14-17: L_index, L_middle, L_pinky, L_ring (proximal)
-#   18: L_thumb_yaw, 19-22: R_index, R_middle, R_pinky, R_ring, 23: R_thumb_yaw
-#   28: L_thumb_pitch, 33: R_thumb_pitch
-#
-# Output order matches Unitree/LeRobot format: [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
-PINK_IK_ACTION_INDICES = {
-    "left_arm": list(range(0, 7)),       # indices 0-6
-    "right_arm": list(range(7, 14)),     # indices 7-13
-    # Left hand reordered: pinky(16), ring(17), middle(15), index(14), thumb_pitch(28), thumb_yaw(18)
-    "left_ee": [16, 17, 15, 14, 28, 18],
-    # Right hand reordered: pinky(21), ring(22), middle(20), index(19), thumb_pitch(33), thumb_yaw(23)
-    "right_ee": [21, 22, 20, 19, 33, 23],
 }
 
 
@@ -158,8 +84,8 @@ class StreamingRecorder(RecorderTerm):
     This recorder writes images as JPEG and state/action data as JSON
     directly to disk during recording, avoiding memory buildup.
 
-    Output format is compatible with Unitree's unitree_IL_lerobot converter
-    when unitree_format=True (default).
+    Joint structure is discovered dynamically from the env's action terms,
+    so it works with any robot without hardcoded joint mappings.
 
     Usage:
         Add this to your env config's recorders:
@@ -206,105 +132,176 @@ class StreamingRecorder(RecorderTerm):
 
         self._recording = False
         self._current_env_id: int | None = None
+        self._metadata_written = False
 
         # Determine which observation keys are images vs states
         self._image_keys: set[str] = set()
         self._state_keys: set[str] = set()
         self._keys_initialized = False
 
-        # Joint indices for Unitree format (populated from robot)
-        self._joint_indices: dict[str, list[int]] = {}  # For robot state (robot joint indices)
-        self._action_indices: dict[str, list[int]] = {}  # For actions (action space indices)
-        self._joint_indices_initialized = False
+        # Dynamic joint structure (discovered from action terms)
+        self._joint_indices: dict[str, list[int]] = {}       # group -> robot joint indices
+        self._action_indices: dict[str, list[int]] = {}      # group -> processed_actions indices
+        self._joint_names_map: dict[str, list[str]] = {}     # group -> joint name list
+        self._eef_link_indices: dict[str, int] = {}           # task_name -> body index
+        self._eef_link_names: dict[str, str] = {}             # task_name -> link name
+        self._robot = None                                     # cached robot reference
+        self._joint_structure_initialized = False
 
-    def _initialize_joint_indices(self):
-        """Initialize joint indices for Unitree format conversion."""
-        if self._joint_indices_initialized:
-            return
+    # ------------------------------------------------------------------
+    # Robot and joint discovery
+    # ------------------------------------------------------------------
 
-        # Get robot from scene
-        robot = None
+    def _find_robot(self):
+        """Find and cache the robot articulation from the scene."""
+        if self._robot is not None:
+            return self._robot
         if hasattr(self._env, "scene"):
             for asset_name in self._env.scene.articulations:
                 asset = self._env.scene.articulations[asset_name]
                 if "robot" in asset_name.lower() or "g1" in asset_name.lower():
-                    robot = asset
-                    break
+                    self._robot = asset
+                    return self._robot
+        return None
 
-        if robot is None:
-            print("[StreamingRecorder] Warning: Could not find robot in scene")
-            self._joint_indices_initialized = True
+    def _discover_joint_structure(self):
+        """Discover joint groups, indices, and EEF links from action terms.
+
+        Queries the Pink IK action term (if present) for arm joints, hand joints,
+        and EEF link names. Splits into left/right groups by name pattern.
+        Falls back to recording all robot joints as a flat group if no IK term found.
+        """
+        if self._joint_structure_initialized:
             return
 
-        # Get joint names from robot
-        joint_names = robot.joint_names
-        print(f"[StreamingRecorder] Robot joint names: {joint_names}")
+        robot = self._find_robot()
+        if robot is None:
+            print("[StreamingRecorder] Warning: Could not find robot in scene")
+            self._joint_structure_initialized = True
+            return
 
-        # Build index mapping for each group
-        for group_name, group_info in G1_INSPIRE_JOINT_MAPPING.items():
-            indices = []
-            for joint_name in group_info["joint_names"]:
-                # Try exact match first
-                if joint_name in joint_names:
-                    indices.append(joint_names.index(joint_name))
-                else:
-                    # Try partial match
-                    found = False
-                    for i, name in enumerate(joint_names):
-                        if joint_name in name or name in joint_name:
-                            indices.append(i)
-                            found = True
-                            break
-                    if not found:
-                        print(f"[StreamingRecorder] Warning: Could not find joint {joint_name}")
-                        indices.append(-1)  # Placeholder
-
-            self._joint_indices[group_name] = indices
-            print(f"[StreamingRecorder] {group_name} indices: {indices}")
-
-        # Get action indices dynamically from Pink IK action term
-        # This ensures action indices match the actual processed_actions ordering
-        self._initialize_action_indices()
-
-        self._joint_indices_initialized = True
-
-    def _initialize_action_indices(self):
-        """Initialize action indices dynamically from Pink IK action term.
-
-        This replaces the hardcoded PINK_IK_ACTION_INDICES with dynamic lookup
-        based on the actual joint names in the Pink IK controller.
-        """
-        # Try to get action term with controlled joint names
+        # --- Find Pink IK action term ---
+        ik_term = None
         if hasattr(self._env, "action_manager"):
             for term_name in self._env.action_manager.active_terms:
                 term = self._env.action_manager.get_term(term_name)
-                if hasattr(term, "_controlled_joint_names"):
-                    # Get the actual joint names from Pink IK (in processed_actions order)
-                    controlled_joint_names = list(term._controlled_joint_names)
-                    print(f"[StreamingRecorder] Pink IK controlled joints ({len(controlled_joint_names)}): {controlled_joint_names}")
+                if hasattr(term, "_isaaclab_controlled_joint_names"):
+                    ik_term = term
+                    break
 
-                    # Build action index mapping using same name matching as state extraction
-                    for group_name, group_info in G1_INSPIRE_JOINT_MAPPING.items():
-                        indices = []
-                        for joint_name in group_info["joint_names"]:
-                            # Find index in controlled_joint_names
-                            found = False
-                            for i, name in enumerate(controlled_joint_names):
-                                if joint_name == name or joint_name in name or name in joint_name:
-                                    indices.append(i)
-                                    found = True
-                                    break
-                            if not found:
-                                print(f"[StreamingRecorder] Warning: Could not find action joint {joint_name}")
-                                indices.append(-1)  # Placeholder
+        if ik_term is None:
+            # Fallback: record ALL robot joints as a single flat group
+            print("[StreamingRecorder] No Pink IK term found, recording all joints as flat group")
+            all_names = list(robot.joint_names)
+            self._joint_indices["joints"] = list(range(len(all_names)))
+            self._joint_names_map["joints"] = all_names
+            self._joint_structure_initialized = True
+            return
 
-                        self._action_indices[group_name] = indices
-                        print(f"[StreamingRecorder] Action {group_name} indices: {indices}")
-                    return
+        # --- Split arm joints into left/right/torso ---
+        arm_names = list(ik_term._isaaclab_controlled_joint_names)
+        arm_ids = list(ik_term._isaaclab_controlled_joint_ids)
 
-        # Fallback to hardcoded indices if no Pink IK term found
-        print("[StreamingRecorder] Warning: No Pink IK term found, using hardcoded PINK_IK_ACTION_INDICES")
-        self._action_indices = {k: list(v) for k, v in PINK_IK_ACTION_INDICES.items()}
+        left_arm_names, left_arm_robot_ids, left_arm_action_ids = [], [], []
+        right_arm_names, right_arm_robot_ids, right_arm_action_ids = [], [], []
+        other_arm_names, other_arm_robot_ids, other_arm_action_ids = [], [], []
+
+        for i, (name, robot_idx) in enumerate(zip(arm_names, arm_ids)):
+            if "left" in name.lower() or name.startswith("L_") or name.startswith("l_"):
+                left_arm_names.append(name)
+                left_arm_robot_ids.append(robot_idx)
+                left_arm_action_ids.append(i)
+            elif "right" in name.lower() or name.startswith("R_") or name.startswith("r_"):
+                right_arm_names.append(name)
+                right_arm_robot_ids.append(robot_idx)
+                right_arm_action_ids.append(i)
+            else:
+                # Torso joints (e.g., waist_yaw, waist_pitch, waist_roll)
+                other_arm_names.append(name)
+                other_arm_robot_ids.append(robot_idx)
+                other_arm_action_ids.append(i)
+
+        # --- Split hand joints into left/right ---
+        hand_names = list(ik_term._hand_joint_names)
+        hand_ids = list(ik_term._hand_joint_ids)
+        n_arm_joints = len(arm_names)
+
+        left_hand_names, left_hand_robot_ids, left_hand_action_ids = [], [], []
+        right_hand_names, right_hand_robot_ids, right_hand_action_ids = [], [], []
+
+        for i, (name, robot_idx) in enumerate(zip(hand_names, hand_ids)):
+            action_idx = n_arm_joints + i  # offset into processed_actions
+            if "left" in name.lower() or name.startswith("L_") or name.startswith("l_"):
+                left_hand_names.append(name)
+                left_hand_robot_ids.append(robot_idx)
+                left_hand_action_ids.append(action_idx)
+            elif "right" in name.lower() or name.startswith("R_") or name.startswith("r_"):
+                right_hand_names.append(name)
+                right_hand_robot_ids.append(robot_idx)
+                right_hand_action_ids.append(action_idx)
+            else:
+                print(f"[StreamingRecorder] Warning: Cannot determine side for hand joint '{name}', skipping")
+
+        # --- Store discovered groups ---
+        if left_arm_robot_ids:
+            self._joint_indices["left_arm"] = left_arm_robot_ids
+            self._action_indices["left_arm"] = left_arm_action_ids
+            self._joint_names_map["left_arm"] = left_arm_names
+
+        if right_arm_robot_ids:
+            self._joint_indices["right_arm"] = right_arm_robot_ids
+            self._action_indices["right_arm"] = right_arm_action_ids
+            self._joint_names_map["right_arm"] = right_arm_names
+
+        if other_arm_robot_ids:
+            self._joint_indices["torso"] = other_arm_robot_ids
+            self._action_indices["torso"] = other_arm_action_ids
+            self._joint_names_map["torso"] = other_arm_names
+
+        if left_hand_robot_ids:
+            self._joint_indices["left_hand"] = left_hand_robot_ids
+            self._action_indices["left_hand"] = left_hand_action_ids
+            self._joint_names_map["left_hand"] = left_hand_names
+
+        if right_hand_robot_ids:
+            self._joint_indices["right_hand"] = right_hand_robot_ids
+            self._action_indices["right_hand"] = right_hand_action_ids
+            self._joint_names_map["right_hand"] = right_hand_names
+
+        # --- Discover EEF links from Pink IK config ---
+        if hasattr(ik_term, "cfg") and hasattr(ik_term.cfg, "target_eef_link_names"):
+            eef_map: dict[str, str] = ik_term.cfg.target_eef_link_names
+            body_names = list(robot.data.body_names)
+            for task_name, link_name in eef_map.items():
+                if link_name in body_names:
+                    self._eef_link_indices[task_name] = body_names.index(link_name)
+                    self._eef_link_names[task_name] = link_name
+                else:
+                    print(f"[StreamingRecorder] Warning: EEF link '{link_name}' not found in body_names")
+
+        self._joint_structure_initialized = True
+        self._print_discovered_structure()
+
+    def _print_discovered_structure(self):
+        """Print the discovered joint structure for debugging."""
+        print("[StreamingRecorder] === Discovered Joint Structure ===")
+        for group_name in self._joint_indices:
+            n_joints = len(self._joint_indices[group_name])
+            names = self._joint_names_map.get(group_name, [])
+            action_ids = self._action_indices.get(group_name, [])
+            print(f"  {group_name}: {n_joints} joints, robot_ids={self._joint_indices[group_name]}, "
+                  f"action_ids={action_ids}")
+            if names:
+                print(f"    names: {names}")
+        if self._eef_link_indices:
+            print("  EEF links:")
+            for task_name, body_idx in self._eef_link_indices.items():
+                print(f"    {task_name}: body_idx={body_idx}, link='{self._eef_link_names[task_name]}'")
+        print("[StreamingRecorder] ================================")
+
+    # ------------------------------------------------------------------
+    # Observation key discovery
+    # ------------------------------------------------------------------
 
     def _initialize_keys(self):
         """Auto-detect image vs state observation keys."""
@@ -333,6 +330,10 @@ class StreamingRecorder(RecorderTerm):
             self._state_keys = set(self.cfg.state_obs_keys)
 
         self._keys_initialized = True
+
+    # ------------------------------------------------------------------
+    # Episode lifecycle
+    # ------------------------------------------------------------------
 
     def reset(self, env_ids: Sequence[int] | None = None):
         """Handle reset - discard current episode if recording (manual reset).
@@ -378,6 +379,7 @@ class StreamingRecorder(RecorderTerm):
             self._current_env_id = env_ids[0] if isinstance(env_ids, (list, tuple)) else env_ids[0].item()
             if self._writer.create_episode():
                 self._recording = True
+                self._metadata_written = False
 
         return None, None
 
@@ -389,6 +391,10 @@ class StreamingRecorder(RecorderTerm):
         # Actions will be captured in record_post_step along with states
         return None, None
 
+    # ------------------------------------------------------------------
+    # Main recording logic
+    # ------------------------------------------------------------------
+
     def record_post_step(self) -> tuple[str | None, torch.Tensor | dict | None]:
         """Called after step - stream data to disk."""
         if not self._recording or self._current_env_id is None:
@@ -396,9 +402,14 @@ class StreamingRecorder(RecorderTerm):
 
         self._initialize_keys()
         if self.cfg.unitree_format:
-            self._initialize_joint_indices()
+            self._discover_joint_structure()
 
         env_id = self._current_env_id
+
+        # Write joint metadata to episode on first frame
+        if self.cfg.unitree_format and not self._metadata_written:
+            self._write_metadata_to_episode()
+            self._metadata_written = True
 
         # Collect images
         colors = {}
@@ -421,41 +432,39 @@ class StreamingRecorder(RecorderTerm):
         raw_actions = None  # Raw Pink IK input for replay/annotate compatibility
 
         if self.cfg.unitree_format:
-            # Get joint positions from robot
-            robot = None
-            if hasattr(self._env, "scene"):
-                for asset_name in self._env.scene.articulations:
-                    asset = self._env.scene.articulations[asset_name]
-                    if "robot" in asset_name.lower() or "g1" in asset_name.lower():
-                        robot = asset
-                        break
+            robot = self._find_robot()
 
             if robot is not None:
                 joint_pos = robot.data.joint_pos[env_id]
 
-                # Extract joint groups for Unitree format
+                # Extract joint states using discovered groups
                 for group_name, indices in self._joint_indices.items():
                     if indices:
-                        # Filter out invalid indices
-                        valid_indices = [i for i in indices if i >= 0]
-                        if valid_indices:
-                            states[group_name] = {"qpos": joint_pos[valid_indices]}
+                        states[group_name] = {"qpos": joint_pos[indices]}
+
+                # Record measured EEF poses (from forward kinematics)
+                if self._eef_link_indices:
+                    body_pos = robot.data.body_pos_w[env_id]
+                    body_quat = robot.data.body_quat_w[env_id]
+                    env_origin = self._env.scene.env_origins[env_id]
+                    for task_name, body_idx in self._eef_link_indices.items():
+                        # Position in env-origin frame (not world frame)
+                        states[f"{task_name}_pos"] = {"qpos": (body_pos[body_idx] - env_origin).cpu().tolist()}
+                        # Quaternion (wxyz convention from IsaacLab)
+                        states[f"{task_name}_quat"] = {"qpos": body_quat[body_idx].cpu().tolist()}
 
             # Get actions from action_manager (commanded positions, not current positions)
-            # This is critical for imitation learning - action should be the target,
-            # not the current state (otherwise delta = action - state = 0)
             if hasattr(self._env, "action_manager"):
                 for term_name in self._env.action_manager.active_terms:
                     term = self._env.action_manager.get_term(term_name)
                     if hasattr(term, "processed_actions") and term.processed_actions is not None:
                         processed = term.processed_actions[env_id]
-                        # Map processed actions to joint groups using action indices
-                        # (not robot joint indices - they have different ordering)
+                        # Map processed actions to joint groups using discovered action indices
                         for group_name, indices in self._action_indices.items():
                             if indices:
-                                valid_indices = [i for i in indices if 0 <= i < len(processed)]
-                                if valid_indices:
-                                    actions[group_name] = {"qpos": processed[valid_indices]}
+                                valid = [i for i in indices if 0 <= i < len(processed)]
+                                if valid:
+                                    actions[group_name] = {"qpos": processed[valid]}
                         break  # Use first action term with processed_actions
 
             # Also capture raw actions (Pink IK input) for replay/annotate compatibility
@@ -491,7 +500,6 @@ class StreamingRecorder(RecorderTerm):
             # Collect scene state (robot joints, etc.) if configured
             if self.cfg.capture_scene_state and hasattr(self._env, "scene"):
                 scene_state = self._env.scene.get_state(is_relative=True)
-                # Extract just the env_id slice
                 def extract_env_state(state_dict, env_id):
                     result = {}
                     for k, v in state_dict.items():
@@ -523,6 +531,27 @@ class StreamingRecorder(RecorderTerm):
         )
 
         return None, None
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    def _write_metadata_to_episode(self):
+        """Write joint group metadata to the episode for downstream converters.
+
+        Stores metadata on the writer so it gets serialized into the episode JSON.
+        This tells downstream converters the joint names and ordering for each group.
+        """
+        metadata = {
+            "joint_groups": {k: list(v) for k, v in self._joint_names_map.items()},
+            "eef_links": dict(self._eef_link_names),
+        }
+        # Store on the writer instance for serialization
+        self._writer.episode_metadata = metadata
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     def close(self, file_path: str):
         """Clean up streaming writer."""
