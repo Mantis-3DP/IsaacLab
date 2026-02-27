@@ -84,14 +84,12 @@ STATE_JOINT_NAMES = [
     "right_hand_joint_3", "right_hand_joint_4", "right_hand_joint_5", "right_hand_joint_6",
 ]
 
-# Camera mapping
+# Camera mapping — single ego-view camera matching OAK-D W IMX378 on real robot
 CAMERA_MAPPING = {
-    "color_0": "observation.images.cam_left_high",
-    "color_1": "observation.images.cam_right_high",
+    "color_0": "observation.images.ego_view",
 }
 VIDEO_MODALITY_KEYS = {
-    "color_0": "cam_left_high",
-    "color_1": "cam_right_high",
+    "color_0": "ego_view",
 }
 
 
@@ -502,16 +500,15 @@ def main():
             "left_hand":  {"original_key": "observation.state", "start": 22, "end": 29},
             "right_arm":  {"original_key": "observation.state", "start": 29, "end": 36},
             "right_hand": {"original_key": "observation.state", "start": 36, "end": 43},
-            "left_eef":   {"original_key": "observation.eef_state", "start": 0,  "end": 9},
-            "right_eef":  {"original_key": "observation.eef_state", "start": 9,  "end": 18},
         },
         "action": {
-            "left_eef":           {"original_key": "action.eef", "start": 0,  "end": 9},
-            "right_eef":          {"original_key": "action.eef", "start": 9,  "end": 18},
+            "left_arm":           {"original_key": "action", "start": 15, "end": 22},
+            "right_arm":          {"original_key": "action", "start": 29, "end": 36},
             "left_hand":          {"original_key": "action", "start": 22, "end": 29},
             "right_hand":         {"original_key": "action", "start": 36, "end": 43},
-            "navigate_command":   {"original_key": "teleop.navigate_command",    "start": 0, "end": 3},
+            "waist":              {"original_key": "action", "start": 12, "end": 15},
             "base_height_command":{"original_key": "teleop.base_height_command", "start": 0, "end": 1},
+            "navigate_command":   {"original_key": "teleop.navigate_command",    "start": 0, "end": 3},
         },
         "video": {},
         "annotation": {

@@ -41,6 +41,7 @@ CAMERA_MAPPING = {
     "cam_right_high": "color_1",
     "cam_left_wrist": "color_2",
     "cam_right_wrist": "color_3",
+    "ego_view": "color_0",
 }
 
 
@@ -316,7 +317,7 @@ class StreamingRecorder(RecorderTerm):
                 # Check if this is an image observation
                 is_image = any(
                     pattern in term_name_lower
-                    for pattern in ["rgb", "image", "camera", "depth", "color"]
+                    for pattern in ["rgb", "image", "camera", "depth", "color", "ego", "view"]
                 )
                 if is_image:
                     self._image_keys.add(term_name)

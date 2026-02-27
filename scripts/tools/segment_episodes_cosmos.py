@@ -43,7 +43,7 @@ import transformers
 
 
 DEFAULT_MODEL_PATH = "/home/mats/Bot/Nvidia/Cosmos-Reason2-2B"
-DEFAULT_CAMERA = "observation.images.cam_left_high"
+DEFAULT_CAMERA = "observation.images.ego_view"
 
 
 def parse_args():
@@ -83,8 +83,8 @@ def parse_args():
         help="FPS to feed video to Cosmos (default: 4).",
     )
     parser.add_argument(
-        "--video_fps", type=int, default=20,
-        help="Original video FPS in the dataset (default: 20).",
+        "--video_fps", type=int, default=50,
+        help="Original video FPS in the dataset (default: 50).",
     )
     return parser.parse_args()
 
@@ -114,13 +114,24 @@ def find_video_files(dataset_dir: Path, camera: str):
 
 
 def load_cosmos_model(model_path: str):
-    """Load Cosmos Reason 2 model and processor."""
+    """Load Cosmos Reason 2 model and processor.
+
+    Requires transformers >= 4.57 for Qwen3VL architecture.
+    Install: pip install transformers>=4.57
+    """
     print(f"Loading Cosmos Reason 2 from {model_path}...")
     t0 = time.perf_counter()
 
+    if not hasattr(transformers, "Qwen3VLForConditionalGeneration"):
+        raise RuntimeError(
+            f"Qwen3VL not available (transformers {transformers.__version__}). "
+            f"Cosmos Reason 2 needs transformers >= 4.57. "
+            f"Run: pip install transformers>=4.57"
+        )
+
     model = transformers.Qwen3VLForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="sdpa",
     )
@@ -412,29 +423,17 @@ def apply_annotations(args):
     for i, s in enumerate(subtasks):
         print(f"  {i}: {s}")
 
-    tasks, episodes = load_dataset_meta(dataset_dir)
+    _, episodes = load_dataset_meta(dataset_dir)
 
-    # Add new subtask entries to tasks.jsonl
-    existing_tasks = {t["task"] for t in tasks}
-    next_task_idx = max(t["task_index"] for t in tasks) + 1
-    subtask_to_task_idx = {}
-
-    for subtask in subtasks:
-        if subtask in existing_tasks:
-            for t in tasks:
-                if t["task"] == subtask:
-                    subtask_to_task_idx[subtask] = t["task_index"]
-                    break
-        else:
-            subtask_to_task_idx[subtask] = next_task_idx
-            tasks.append({"task_index": next_task_idx, "task": subtask})
-            next_task_idx += 1
+    # Replace tasks.jsonl with subtask entries (0-indexed)
+    tasks = [{"task_index": i, "task": s} for i, s in enumerate(subtasks)]
 
     print(f"\nTask index mapping:")
-    for subtask, idx in subtask_to_task_idx.items():
-        print(f"  {idx}: {subtask}")
+    for i, s in enumerate(subtasks):
+        print(f"  {i}: {s}")
 
-    label_to_task_idx = [subtask_to_task_idx[s] for s in subtasks]
+    # frame_labels in the annotations are already 0-indexed matching subtask order
+    label_to_task_idx = list(range(len(subtasks)))
 
     # Update parquet files
     updated_count = 0

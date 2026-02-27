@@ -5,24 +5,39 @@
 Uses the Isaac-PickPlace-Locomanipulation-Camera-G1-Abs-v0 environment with:
 - Agile RL locomotion policy embedded as ActionTerm (runs inside env.step())
 - JointPositionActionCfg for upper body (replaces Pink IK)
-- GR00T model via PolicyClient for stereo cameras + joint state → actions
+- GR00T model via PolicyClient for ego_view camera + joint state → actions
+- Optional: Cosmos VLM subtask monitor for dynamic task description switching
 
 Usage:
     # Terminal 1: Start GR00T server
     cd /home/mats/Bot/Nvidia/Isaac-GR00T
-    uv run python -c "
-    exec(open('examples/G1TriHand/g1_trihand_stereo_config.py').read())
-    from gr00t.eval.run_gr00t_server import main, ServerConfig
-    import tyro; main(tyro.cli(ServerConfig))
-    " --model-path /home/mats/Bot/Models/g1_locomanip_finetune/checkpoint-3000 \
-      --embodiment-tag NEW_EMBODIMENT --port 5555
+    conda activate gr00t
+    uv run python gr00t/eval/run_gr00t_server.py \
+        --model-path /home/mats/Bot/Models/g1_locomanip_finetune_3/checkpoint-4000 \
+        --embodiment-tag UNITREE_G1 --port 5555
 
-    # Terminal 2: Run this eval script
-    cd /home/mats/Bot/unitree/IsaacLab
+    # Terminal 2 (optional): Start Cosmos VLM subtask monitor
+    conda activate cosmos
+    python scripts/tools/run_cosmos_vlm_server.py \
+        --model_path ~/Bot/Nvidia/Cosmos-Reason2-2B \
+        --task "grab wheel, walk right, place in basket, walk left" \
+        --subtasks "grab the wheel" "walk right to the basket" \
+                   "place the wheel in the basket" "walk left" \
+        --port 5556
+
+    # Terminal 3: Run this eval script
     ./isaaclab.sh -p scripts/tools/eval_groot_locomanip.py \
         --task Isaac-PickPlace-Locomanipulation-Camera-G1-Abs-v0 \
         --policy_port 5555 --action_horizon 8 \
         --num_envs 1 --enable_cameras
+
+    # With dynamic subtask switching:
+    ./isaaclab.sh -p scripts/tools/eval_groot_locomanip.py \
+        --task Isaac-PickPlace-Locomanipulation-Camera-G1-Abs-v0 \
+        --policy_port 5555 --action_horizon 8 \
+        --subtasks "grab the wheel" "walk right to the basket" \
+                   "place the wheel in the basket" "walk left" \
+        --cosmos_port 5556
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -45,12 +60,24 @@ parser.add_argument("--policy_port", type=int, default=5555, help="GR00T server 
 parser.add_argument(
     "--task_description",
     type=str,
-    default="pick up the wheel with left hand, grab with right hand, walk right, and place it in the basket",
+    default="pick up the wheel, walk right, and place it in the basket",
     help="Language instruction for the task.",
 )
 parser.add_argument("--action_horizon", type=int, default=8, help="Actions to execute per query.")
-parser.add_argument("--max_steps", type=int, default=1000, help="Maximum steps per episode.")
+parser.add_argument("--num_episodes", type=int, default=10, help="Number of episodes to evaluate.")
 parser.add_argument("--save_video", action="store_true", default=False, help="Save video.")
+
+# Cosmos VLM subtask monitor (optional — enables dynamic task description switching)
+parser.add_argument(
+    "--subtasks", nargs="+", default=None,
+    help="Ordered subtask labels. Enables hierarchical mode with Cosmos VLM monitor.",
+)
+parser.add_argument("--cosmos_host", type=str, default="localhost", help="Cosmos VLM server host.")
+parser.add_argument("--cosmos_port", type=int, default=5556, help="Cosmos VLM server port.")
+parser.add_argument(
+    "--cosmos_interval", type=int, default=25,
+    help="Push a frame to Cosmos every N env steps (25 = 0.5s at 50Hz).",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -65,6 +92,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import contextlib
+import io
 import time
 from collections import OrderedDict
 
@@ -78,6 +106,123 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 
 from gr00t.policy.server_client import PolicyClient
+
+
+# ---------------------------------------------------------------------------
+# Cosmos VLM subtask monitor client
+# ---------------------------------------------------------------------------
+
+class SubtaskMonitorClient:
+    """Thin ZMQ client for the Cosmos VLM subtask monitor server.
+
+    Sends ego_view frames and receives subtask classifications.
+    VLM is the authority — subtask can go forward or backward (e.g. re-grab after drop).
+    """
+
+    def __init__(self, host: str, port: int, subtasks: list[str], timeout_ms: int = 5000):
+        import msgpack as _msgpack
+        import zmq as _zmq
+        self._msgpack = _msgpack
+        self._zmq = _zmq
+
+        self.subtasks = subtasks
+        self.current_index = 0
+        self.transition_log = []  # [(step, from_idx, to_idx)]
+
+        self._context = _zmq.Context()
+        self._socket = self._context.socket(_zmq.REQ)
+        self._socket.setsockopt(_zmq.RCVTIMEO, timeout_ms)
+        self._socket.setsockopt(_zmq.SNDTIMEO, timeout_ms)
+        self._socket.connect(f"tcp://{host}:{port}")
+
+    def _send(self, request: dict) -> dict:
+        self._socket.send(self._msgpack.packb(request, use_bin_type=True))
+        return self._msgpack.unpackb(self._socket.recv(), raw=False)
+
+    def ping(self) -> bool:
+        try:
+            resp = self._send({"endpoint": "ping"})
+            return resp.get("status") == "ok"
+        except Exception:
+            return False
+
+    def _rgb_to_jpeg(self, rgb: np.ndarray) -> bytes:
+        """Encode RGB numpy array to JPEG bytes."""
+        from PIL import Image
+        img = Image.fromarray(rgb)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+    def push_frame(self, rgb: np.ndarray, step: int) -> str:
+        """Send a frame to Cosmos, get back the current subtask.
+
+        Uses push_frame endpoint (async mode — returns cached response).
+        VLM decides freely — can go forward or backward.
+        """
+        jpeg = self._rgb_to_jpeg(rgb)
+        try:
+            resp = self._send({
+                "endpoint": "push_frame",
+                "data": {"jpeg": jpeg},
+            })
+        except Exception as e:
+            print(f"[Cosmos] Push failed: {e}")
+            return self.subtasks[self.current_index]
+
+        raw_response = resp.get("response", "")
+        if not raw_response:
+            return self.subtasks[self.current_index]
+
+        # Match response to closest subtask (fuzzy)
+        matched_idx = self._match_subtask(raw_response)
+        if matched_idx is not None and matched_idx != self.current_index:
+            old_idx = self.current_index
+            self.current_index = matched_idx
+            self.transition_log.append((step, old_idx, matched_idx))
+            direction = "→" if matched_idx > old_idx else "←"
+            print(f"  [Subtask] step {step}: '{self.subtasks[old_idx]}' {direction} '{self.subtasks[matched_idx]}'")
+
+        return self.subtasks[self.current_index]
+
+    def _match_subtask(self, response: str) -> int | None:
+        """Fuzzy-match VLM response to a subtask index."""
+        response_lower = response.strip().lower()
+
+        # Exact match first
+        for i, st in enumerate(self.subtasks):
+            if st.lower() == response_lower:
+                return i
+
+        # Substring match
+        for i, st in enumerate(self.subtasks):
+            if st.lower() in response_lower or response_lower in st.lower():
+                return i
+
+        # Word overlap match
+        resp_words = set(response_lower.split())
+        best_idx, best_score = None, 0
+        for i, st in enumerate(self.subtasks):
+            st_words = set(st.lower().split())
+            overlap = len(resp_words & st_words)
+            if overlap > best_score:
+                best_score = overlap
+                best_idx = i
+
+        if best_score >= 2:
+            return best_idx
+
+        print(f"  [Cosmos] Could not match response: '{response[:60]}'")
+        return None
+
+    def reset(self):
+        """Reset to first subtask for a new episode."""
+        self.current_index = 0
+        self.transition_log.clear()
+
+    def close(self):
+        self._socket.close()
+        self._context.term()
 
 
 def make_groot_eval_compatible(env_cfg):
@@ -101,15 +246,6 @@ def make_groot_eval_compatible(env_cfg):
 
     if hasattr(env_cfg, "recorders") and env_cfg.recorders is not None:
         env_cfg.recorders = None
-
-    # Disable all termination terms (object_dropping, success, time_out)
-    # so the eval runs open-ended without mid-episode resets
-    if hasattr(env_cfg, "terminations") and env_cfg.terminations is not None:
-        for attr in list(vars(env_cfg.terminations).keys()):
-            if not attr.startswith("_"):
-                delattr(env_cfg.terminations, attr)
-
-    env_cfg.episode_length_s = 99999.0
 
 
 class LocomanipGR00TAdapter:
@@ -188,22 +324,16 @@ class LocomanipGR00TAdapter:
             values = joint_pos[idx].cpu().numpy().astype(np.float32)
             state_dict[group] = values[np.newaxis, np.newaxis, :]  # (1, 1, N)
 
-        # Stereo cameras
-        cam_left = env.scene["left_high_camera"].data.output["rgb"][env_id].cpu().numpy()
-        cam_right = env.scene["right_high_camera"].data.output["rgb"][env_id].cpu().numpy()
+        # Ego-view camera
+        cam_ego = env.scene["ego_view_camera"].data.output["rgb"][env_id].cpu().numpy()
 
-        if cam_left.shape[-1] == 4:
-            cam_left = cam_left[..., :3]
-        if cam_right.shape[-1] == 4:
-            cam_right = cam_right[..., :3]
-        if cam_left.dtype != np.uint8:
-            cam_left = (cam_left * 255).clip(0, 255).astype(np.uint8)
-        if cam_right.dtype != np.uint8:
-            cam_right = (cam_right * 255).clip(0, 255).astype(np.uint8)
+        if cam_ego.shape[-1] == 4:
+            cam_ego = cam_ego[..., :3]
+        if cam_ego.dtype != np.uint8:
+            cam_ego = (cam_ego * 255).clip(0, 255).astype(np.uint8)
 
         video_dict = {
-            "cam_left_high": cam_left[np.newaxis, np.newaxis, ...],   # (1, 1, H, W, 3)
-            "cam_right_high": cam_right[np.newaxis, np.newaxis, ...],
+            "ego_view": cam_ego[np.newaxis, np.newaxis, ...],   # (1, 1, H, W, 3)
         }
 
         language_dict = {
@@ -213,10 +343,9 @@ class LocomanipGR00TAdapter:
         # Debug: first frame
         if not self._saved_debug:
             self._saved_debug = True
-            cv2.imwrite("/tmp/locomanip_cam_left.png", cv2.cvtColor(cam_left, cv2.COLOR_RGB2BGR))
-            cv2.imwrite("/tmp/locomanip_cam_right.png", cv2.cvtColor(cam_right, cv2.COLOR_RGB2BGR))
-            print(f"[Adapter] Debug images → /tmp/locomanip_cam_*.png")
-            print(f"[Adapter] cam_left: {cam_left.shape}, cam_right: {cam_right.shape}")
+            cv2.imwrite("/tmp/locomanip_cam_ego.png", cv2.cvtColor(cam_ego, cv2.COLOR_RGB2BGR))
+            print(f"[Adapter] Debug image → /tmp/locomanip_cam_ego.png")
+            print(f"[Adapter] cam_ego: {cam_ego.shape}")
             for k, v in state_dict.items():
                 print(f"[Adapter]   state.{k}: {v.shape} = {v[0, 0]}")
 
@@ -261,79 +390,161 @@ def main():
         raise RuntimeError("Failed to connect to GR00T server.")
     print("Connected to GR00T server")
 
+    # -- Optional: Cosmos VLM subtask monitor --
+    cosmos_monitor = None
+    if args_cli.subtasks:
+        print(f"Connecting to Cosmos VLM at {args_cli.cosmos_host}:{args_cli.cosmos_port}")
+        cosmos_monitor = SubtaskMonitorClient(
+            host=args_cli.cosmos_host,
+            port=args_cli.cosmos_port,
+            subtasks=args_cli.subtasks,
+        )
+        if not cosmos_monitor.ping():
+            raise RuntimeError("Failed to connect to Cosmos VLM server.")
+        print(f"Connected to Cosmos VLM — subtasks: {args_cli.subtasks}")
+        initial_task = args_cli.subtasks[0]
+    else:
+        initial_task = args_cli.task_description
+
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     make_groot_eval_compatible(env_cfg)
 
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-    adapter = LocomanipGR00TAdapter(policy_client, args_cli.task_description, env)
+    adapter = LocomanipGR00TAdapter(policy_client, initial_task, env)
 
     device = env.device
     dtype = env.scene["robot"].data.joint_pos.dtype
 
-    obs_dict, _ = env.reset()
-
-    video_frames = [] if args_cli.save_video else None
-    step_count = 0
-    action_queue = []
+    num_episodes = args_cli.num_episodes
+    results = []
 
     print(f"\nStarting GR00T locomanip evaluation")
-    print(f"  Task: {args_cli.task_description}")
+    print(f"  Task: {initial_task}")
+    if cosmos_monitor:
+        print(f"  Mode: hierarchical (Cosmos VLM subtask monitor)")
+        print(f"  Cosmos interval: every {args_cli.cosmos_interval} steps ({args_cli.cosmos_interval * 0.02:.1f}s)")
+    else:
+        print(f"  Mode: static task description")
     print(f"  Action horizon: {args_cli.action_horizon}")
-    print(f"  Max steps: {args_cli.max_steps}")
+    print(f"  Episodes: {num_episodes}")
 
+    episode_idx = 0
     with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
-        while simulation_app.is_running() and not simulation_app.is_exiting():
+        while episode_idx < num_episodes and simulation_app.is_running() and not simulation_app.is_exiting():
+            obs_dict, _ = env.reset()
+            action_queue = []
+            step_count = 0
+            video_frames = [] if args_cli.save_video else None
 
-            if len(action_queue) == 0:
-                t0 = time.perf_counter()
-                groot_obs = adapter.obs_to_groot(env)
-                action_chunk, info = adapter.policy.get_action(groot_obs)
-                latency_ms = (time.perf_counter() - t0) * 1000
+            # Reset subtask monitor for new episode
+            if cosmos_monitor:
+                cosmos_monitor.reset()
+                adapter.task_description = args_cli.subtasks[0]
 
-                horizon = np.asarray(action_chunk["left_arm"]).shape[1]
-                for t in range(min(args_cli.action_horizon, horizon)):
-                    action_queue.append(adapter.decode_action(action_chunk, t))
+            print(f"\n--- Episode {episode_idx + 1}/{num_episodes} ---")
+            if cosmos_monitor:
+                print(f"  [Subtask] starting: '{adapter.task_description}'")
 
-                if step_count == 0:
-                    a0 = action_queue[0]
-                    print(f"\n[Eval] First chunk: horizon={horizon}, latency={latency_ms:.0f}ms")
-                    for k, v in a0.items():
-                        print(f"  {k}: shape={v.shape}, values={v[:4]}...")
-                elif step_count % 50 == 0:
-                    print(f"[Eval] Step {step_count}, latency={latency_ms:.0f}ms")
+            while simulation_app.is_running() and not simulation_app.is_exiting():
+                # -- Cosmos subtask update --
+                if cosmos_monitor and step_count > 0 and step_count % args_cli.cosmos_interval == 0:
+                    cam_rgb = env.scene["ego_view_camera"].data.output["rgb"][0].cpu().numpy()
+                    if cam_rgb.shape[-1] == 4:
+                        cam_rgb = cam_rgb[..., :3]
+                    if cam_rgb.dtype != np.uint8:
+                        cam_rgb = (cam_rgb * 255).clip(0, 255).astype(np.uint8)
+                    new_subtask = cosmos_monitor.push_frame(cam_rgb, step_count)
+                    adapter.task_description = new_subtask
 
-            action_dict = action_queue.pop(0)
-            action_tensor = adapter.build_action_tensor(action_dict, device, dtype)
+                if len(action_queue) == 0:
+                    t0 = time.perf_counter()
+                    groot_obs = adapter.obs_to_groot(env)
+                    action_chunk, info = adapter.policy.get_action(groot_obs)
+                    latency_ms = (time.perf_counter() - t0) * 1000
 
-            obs_dict, _, terminated, truncated, _ = env.step(action_tensor)
+                    horizon = np.asarray(action_chunk["left_arm"]).shape[1]
+                    for t in range(min(args_cli.action_horizon, horizon)):
+                        action_queue.append(adapter.decode_action(action_chunk, t))
 
-            if video_frames is not None:
-                cam = env.scene["left_high_camera"].data.output["rgb"][0].cpu().numpy()
-                if cam.shape[-1] == 4:
-                    cam = cam[..., :3]
-                if cam.dtype != np.uint8:
-                    cam = (cam * 255).clip(0, 255).astype(np.uint8)
-                video_frames.append(cam)
+                    if step_count == 0:
+                        print(f"  First chunk: horizon={horizon}, latency={latency_ms:.0f}ms")
+                    elif step_count % 100 == 0:
+                        subtask_info = f", subtask='{adapter.task_description}'" if cosmos_monitor else ""
+                        print(f"  Step {step_count}, latency={latency_ms:.0f}ms{subtask_info}")
 
-            step_count += 1
-            if step_count % 100 == 0:
-                print(f"Step {step_count}/{args_cli.max_steps}")
-            if step_count >= args_cli.max_steps:
-                print(f"\nReached max steps ({args_cli.max_steps})")
-                break
+                action_dict = action_queue.pop(0)
+                action_tensor = adapter.build_action_tensor(action_dict, device, dtype)
 
-    if video_frames and len(video_frames) > 0:
-        video_path = "/tmp/groot_locomanip_eval.mp4"
-        h, w = video_frames[0].shape[:2]
-        writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (w, h))
-        for frame in video_frames:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        writer.release()
-        print(f"Saved {len(video_frames)} frames to {video_path}")
+                obs_dict, _, terminated, truncated, infos = env.step(action_tensor)
 
+                if video_frames is not None:
+                    cam = env.scene["ego_view_camera"].data.output["rgb"][0].cpu().numpy()
+                    if cam.shape[-1] == 4:
+                        cam = cam[..., :3]
+                    if cam.dtype != np.uint8:
+                        cam = (cam * 255).clip(0, 255).astype(np.uint8)
+                    video_frames.append(cam)
+
+                step_count += 1
+
+                if terminated.any() or truncated.any():
+                    fired = {}
+                    tm = env.termination_manager
+                    for i, name in enumerate(tm._term_names):
+                        if tm._term_dones[0, i]:
+                            fired[name] = True
+
+                    outcome = ", ".join(fired.keys()) if fired else ("truncated" if truncated.any() else "terminated")
+                    ep_result = {"outcome": fired, "steps": step_count}
+                    if cosmos_monitor:
+                        ep_result["subtask_transitions"] = list(cosmos_monitor.transition_log)
+                        ep_result["final_subtask"] = cosmos_monitor.current_index
+                    results.append(ep_result)
+                    print(f"  >> {outcome} at step {step_count} ({step_count * 0.02:.1f}s)")
+                    if cosmos_monitor:
+                        print(f"  >> Final subtask: '{args_cli.subtasks[cosmos_monitor.current_index]}' "
+                              f"({len(cosmos_monitor.transition_log)} transitions)")
+                    break
+
+            # Save per-episode video
+            if video_frames and len(video_frames) > 0:
+                video_path = f"/tmp/groot_locomanip_eval_ep{episode_idx:02d}.mp4"
+                h, w = video_frames[0].shape[:2]
+                writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), 50.0, (w, h))
+                for frame in video_frames:
+                    writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                writer.release()
+                print(f"  Saved {len(video_frames)} frames → {video_path}")
+
+            episode_idx += 1
+
+    # Summary
+    total = len(results)
     print(f"\n{'='*50}")
-    print(f"Evaluation complete: {step_count} steps")
+    print(f"  EVALUATION RESULTS ({total} episodes)")
+    if cosmos_monitor:
+        print(f"  Mode: hierarchical ({len(args_cli.subtasks)} subtasks)")
     print(f"{'='*50}")
+
+    term_counts = {}
+    for r in results:
+        for name in r["outcome"]:
+            term_counts[name] = term_counts.get(name, 0) + 1
+
+    for name, count in sorted(term_counts.items()):
+        print(f"  {name:20s}: {count}/{total} ({100*count/total:.0f}%)")
+
+    print(f"{'='*50}")
+    for i, r in enumerate(results):
+        terms = ", ".join(r["outcome"].keys())
+        subtask_str = ""
+        if "final_subtask" in r:
+            subtask_str = f"  subtask={r['final_subtask']}/{len(args_cli.subtasks)-1}"
+        print(f"  Ep {i+1:2d}: {terms:20s} @ {r['steps']:4d} steps ({r['steps']*0.02:.1f}s){subtask_str}")
+
+    if cosmos_monitor:
+        cosmos_monitor.close()
+
     env.close()
 
 
