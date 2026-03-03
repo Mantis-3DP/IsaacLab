@@ -72,11 +72,21 @@ parser.add_argument(
     "--subtasks", nargs="+", default=None,
     help="Ordered subtask labels. Enables hierarchical mode with Cosmos VLM monitor.",
 )
+parser.add_argument(
+    "--transitions", nargs="+", default=None,
+    help="Yes/no questions for each subtask transition. One per subtask. "
+         "When the VLM answers 'yes', advance to next subtask. "
+         "E.g.: 'Is the robot holding the wheel?' 'Is the basket visible?' 'Is the wheel in the basket?'",
+)
 parser.add_argument("--cosmos_host", type=str, default="localhost", help="Cosmos VLM server host.")
 parser.add_argument("--cosmos_port", type=int, default=5556, help="Cosmos VLM server port.")
 parser.add_argument(
     "--cosmos_interval", type=int, default=25,
     help="Push a frame to Cosmos every N env steps (25 = 0.5s at 50Hz).",
+)
+parser.add_argument(
+    "--debounce", type=int, default=3,
+    help="Consecutive VLM votes needed before switching subtask (default 3).",
 )
 
 AppLauncher.add_app_launcher_args(parser)
@@ -116,10 +126,12 @@ class SubtaskMonitorClient:
     """Thin ZMQ client for the Cosmos VLM subtask monitor server.
 
     Sends ego_view frames and receives subtask classifications.
-    VLM is the authority — subtask can go forward or backward (e.g. re-grab after drop).
+    VLM is the authority — subtask can go forward or backward.
+    Debouncing prevents flickering between subtasks.
     """
 
-    def __init__(self, host: str, port: int, subtasks: list[str], timeout_ms: int = 5000):
+    def __init__(self, host: str, port: int, subtasks: list[str],
+                 timeout_ms: int = 5000, debounce: int = 3):
         import msgpack as _msgpack
         import zmq as _zmq
         self._msgpack = _msgpack
@@ -128,6 +140,11 @@ class SubtaskMonitorClient:
         self.subtasks = subtasks
         self.current_index = 0
         self.transition_log = []  # [(step, from_idx, to_idx)]
+
+        # Debounce: require N consecutive votes for a different subtask before switching
+        self._debounce = debounce
+        self._candidate_idx = None
+        self._candidate_count = 0
 
         self._context = _zmq.Context()
         self._socket = self._context.socket(_zmq.REQ)
@@ -147,19 +164,19 @@ class SubtaskMonitorClient:
             return False
 
     def _rgb_to_jpeg(self, rgb: np.ndarray) -> bytes:
-        """Encode RGB numpy array to JPEG bytes."""
         from PIL import Image
         img = Image.fromarray(rgb)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
 
-    def push_frame(self, rgb: np.ndarray, step: int) -> str:
-        """Send a frame to Cosmos, get back the current subtask.
+    @staticmethod
+    def _strip_think(text: str) -> str:
+        import re
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-        Uses push_frame endpoint (async mode — returns cached response).
-        VLM decides freely — can go forward or backward.
-        """
+    def push_frame(self, rgb: np.ndarray, step: int) -> str:
+        """Send a frame to Cosmos, get back the current subtask."""
         jpeg = self._rgb_to_jpeg(rgb)
         try:
             resp = self._send({
@@ -167,43 +184,63 @@ class SubtaskMonitorClient:
                 "data": {"jpeg": jpeg},
             })
         except Exception as e:
-            print(f"[Cosmos] Push failed: {e}")
+            print(f"  [Cosmos] Push failed: {e}")
             return self.subtasks[self.current_index]
 
-        raw_response = resp.get("response", "")
+        raw_response = self._strip_think(resp.get("response", ""))
         if not raw_response:
             return self.subtasks[self.current_index]
 
-        # Match response to closest subtask (fuzzy)
         matched_idx = self._match_subtask(raw_response)
-        if matched_idx is not None and matched_idx != self.current_index:
+        if matched_idx is None or matched_idx == self.current_index:
+            self._candidate_idx = None
+            self._candidate_count = 0
+            return self.subtasks[self.current_index]
+
+        # Debounce
+        if matched_idx == self._candidate_idx:
+            self._candidate_count += 1
+        else:
+            self._candidate_idx = matched_idx
+            self._candidate_count = 1
+
+        if self._candidate_count >= self._debounce:
             old_idx = self.current_index
             self.current_index = matched_idx
             self.transition_log.append((step, old_idx, matched_idx))
             direction = "→" if matched_idx > old_idx else "←"
-            print(f"  [Subtask] step {step}: '{self.subtasks[old_idx]}' {direction} '{self.subtasks[matched_idx]}'")
+            print(f"  [Subtask] step {step}: '{self.subtasks[old_idx]}' {direction} "
+                  f"'{self.subtasks[matched_idx]}' ({self._debounce}x confirmed)")
+            self._candidate_idx = None
+            self._candidate_count = 0
+        else:
+            pass
 
         return self.subtasks[self.current_index]
 
     def _match_subtask(self, response: str) -> int | None:
-        """Fuzzy-match VLM response to a subtask index."""
+        import re
         response_lower = response.strip().lower()
 
-        # Exact match first
         for i, st in enumerate(self.subtasks):
             if st.lower() == response_lower:
                 return i
 
-        # Substring match
+        num_match = re.match(r"^(\d+)", response_lower)
+        if num_match:
+            idx = int(num_match.group(1)) - 1
+            if 0 <= idx < len(self.subtasks):
+                return idx
+
         for i, st in enumerate(self.subtasks):
             if st.lower() in response_lower or response_lower in st.lower():
                 return i
 
-        # Word overlap match
-        resp_words = set(response_lower.split())
+        stop_words = {"the", "a", "an", "to", "in", "is", "of", "and", "with"}
+        resp_words = set(response_lower.split()) - stop_words
         best_idx, best_score = None, 0
         for i, st in enumerate(self.subtasks):
-            st_words = set(st.lower().split())
+            st_words = set(st.lower().split()) - stop_words
             overlap = len(resp_words & st_words)
             if overlap > best_score:
                 best_score = overlap
@@ -212,13 +249,14 @@ class SubtaskMonitorClient:
         if best_score >= 2:
             return best_idx
 
-        print(f"  [Cosmos] Could not match response: '{response[:60]}'")
+        print(f"  [Cosmos] Could not match: '{response[:80]}'")
         return None
 
     def reset(self):
-        """Reset to first subtask for a new episode."""
         self.current_index = 0
         self.transition_log.clear()
+        self._candidate_idx = None
+        self._candidate_count = 0
 
     def close(self):
         self._socket.close()
@@ -398,6 +436,7 @@ def main():
             host=args_cli.cosmos_host,
             port=args_cli.cosmos_port,
             subtasks=args_cli.subtasks,
+            debounce=args_cli.debounce,
         )
         if not cosmos_monitor.ping():
             raise RuntimeError("Failed to connect to Cosmos VLM server.")

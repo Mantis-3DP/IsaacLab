@@ -239,7 +239,7 @@ class CosmosServer:
 
             t0 = time.perf_counter()
             try:
-                response = self.vlm.query([frame], self.default_prompt)
+                response = self.vlm.query([frame], self.default_prompt, max_new_tokens=50)
             except Exception as e:
                 print(f"[bg] Inference error: {e}")
                 continue
@@ -305,19 +305,26 @@ class CosmosServer:
 # CLI
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROMPT_TEMPLATE = """Based on this image from a robot's ego-view camera, which subtask is the robot currently performing?
+DEFAULT_PROMPT_TEMPLATE = """Robot ego-view camera. Task: {task}
 
-The full task is: {task}
-
-The possible subtasks in order are:
+Steps:
 {subtasks}
 
-Reply with ONLY the subtask name from the list above, nothing else."""
+What step is the robot on? Look at the SCENE:
+- Object still on the table/surface → grabbing step
+- Object gone from table, no container/target in view → walking step
+- A container, basket, or plate visible in the frame → placing step
+- Hands empty, back at start → done/return step
+{scene_hints}
+Reply with ONLY the step number and name."""
 
 
-def build_default_prompt(task: str, subtasks: list[str]) -> str:
+def build_default_prompt(task: str, subtasks: list[str],
+                         scene_hints: str = "") -> str:
     subtask_list = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtasks))
-    return DEFAULT_PROMPT_TEMPLATE.format(task=task, subtasks=subtask_list)
+    hints = f"\n{scene_hints}\n" if scene_hints else ""
+    return DEFAULT_PROMPT_TEMPLATE.format(task=task, subtasks=subtask_list,
+                                          scene_hints=hints)
 
 
 def main():
@@ -340,6 +347,9 @@ def main():
                         help="Full task description (fills {task} in default prompt).")
     parser.add_argument("--subtasks", nargs="+", default=None,
                         help="Ordered subtask labels (fills {subtasks} in default prompt).")
+    parser.add_argument("--scene_hints", type=str, default=None,
+                        help="Extra visual cues appended to the prompt, e.g. "
+                             "'The basket is grey. When it appears in the frame, transition to placing.'")
     parser.add_argument("--default_prompt", type=str, default=None,
                         help="Custom default prompt template. Use {task} and {subtasks} placeholders. "
                              "If --task/--subtasks are set without this, uses built-in template.")
@@ -356,7 +366,10 @@ def main():
             subtask_list = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(args.subtasks))
             default_prompt = default_prompt.replace("{subtasks}", subtask_list)
     elif args.task and args.subtasks:
-        default_prompt = build_default_prompt(args.task, args.subtasks)
+        default_prompt = build_default_prompt(
+            args.task, args.subtasks,
+            scene_hints=args.scene_hints or "",
+        )
 
     if default_prompt:
         print(f"[config] Default prompt:\n{default_prompt}\n")
